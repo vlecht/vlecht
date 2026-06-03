@@ -1,0 +1,296 @@
+use crate::error::DbError;
+use crate::repo::{PublicKey, RepoAlias};
+use crate::Db;
+use sqlx::Row;
+
+/// Trait abstracting knot server data access.
+///
+/// Designed so Postgres/MySQL backends can implement it later.
+#[async_trait::async_trait]
+pub trait RepoStore {
+    // --- repo_keys + repo_aliases ---
+
+    /// Look up a repo by owner DID + rkey (repo name) via the aliases table.
+    async fn find_repo_alias(&self, owner_did: &str, rkey: &str) -> Result<RepoAlias, DbError>;
+
+    /// Get the repo DID for an owner/name pair (direct repo_keys lookup).
+    async fn get_repo_did_by_name(&self, owner_did: &str, repo_name: &str) -> Result<String, DbError>;
+
+    /// Get owner DID + rkey for a repo DID, newest alias first.
+    /// Matches Go `GetRepoKeyOwner`.
+    async fn get_repo_key_owner(&self, repo_did: &str) -> Result<(String, String), DbError>;
+
+    /// Store a new repo key + initial alias atomically.
+    /// Matches Go `StoreRepoKey` / `StoreRepoDidWeb`.
+    async fn create_repo(
+        &self,
+        repo_did: &str,
+        signing_key: Option<&[u8]>,
+        owner_did: &str,
+        repo_name: &str,
+        key_type: &str,
+    ) -> Result<(), DbError>;
+
+    /// Delete a repo from repo_keys and repo_aliases.
+    /// Matches Go `DeleteRepoKey`.
+    async fn delete_repo(&self, repo_did: &str) -> Result<(), DbError>;
+
+    /// Check if a repo DID exists.
+    async fn repo_did_exists(&self, repo_did: &str) -> Result<bool, DbError>;
+
+    // --- public_keys ---
+
+    /// Get all public keys for a DID.
+    async fn get_public_keys(&self, did: &str) -> Result<Vec<PublicKey>, DbError>;
+
+    /// Get all public keys.
+    async fn get_all_public_keys(&self) -> Result<Vec<PublicKey>, DbError>;
+
+    /// Add a public key for a DID (insert or ignore).
+    async fn add_public_key(&self, did: &str, key: &str, created: &str) -> Result<(), DbError>;
+
+    /// Remove all public keys for a DID.
+    async fn remove_public_keys(&self, did: &str) -> Result<(), DbError>;
+
+    // --- known_dids ---
+
+    /// Add a DID to the known_dids set (insert or ignore).
+    async fn add_did(&self, did: &str) -> Result<(), DbError>;
+
+    /// Remove a DID from known_dids.
+    async fn remove_did(&self, did: &str) -> Result<(), DbError>;
+
+    /// List all known DIDs.
+    async fn get_all_dids(&self) -> Result<Vec<String>, DbError>;
+}
+
+// --- SQLite implementation ---
+
+#[async_trait::async_trait]
+impl RepoStore for Db {
+    async fn find_repo_alias(&self, owner_did: &str, rkey: &str) -> Result<RepoAlias, DbError> {
+        let row = sqlx::query(
+            "SELECT owner_did, rkey, repo_did, rev FROM repo_aliases WHERE owner_did = ? AND rkey = ?",
+        )
+        .bind(owner_did)
+        .bind(rkey)
+        .fetch_optional(self.pool())
+        .await?;
+
+        match row {
+            Some(r) => Ok(RepoAlias {
+                owner_did: r.try_get("owner_did")?,
+                rkey: r.try_get("rkey")?,
+                repo_did: r.try_get("repo_did")?,
+                rev: r.try_get("rev")?,
+            }),
+            None => Err(DbError::RepoNotFound {
+                owner: owner_did.to_owned(),
+                name: rkey.to_owned(),
+            }),
+        }
+    }
+
+    async fn get_repo_did_by_name(&self, owner_did: &str, repo_name: &str) -> Result<String, DbError> {
+        let row = sqlx::query(
+            "SELECT repo_did FROM repo_keys WHERE owner_did = ? AND repo_name = ?",
+        )
+        .bind(owner_did)
+        .bind(repo_name)
+        .fetch_optional(self.pool())
+        .await?;
+
+        match row {
+            Some(r) => Ok(r.try_get("repo_did")?),
+            None => Err(DbError::RepoNotFound {
+                owner: owner_did.to_owned(),
+                name: repo_name.to_owned(),
+            }),
+        }
+    }
+
+    async fn get_repo_key_owner(&self, repo_did: &str) -> Result<(String, String), DbError> {
+        let row = sqlx::query(
+            "SELECT owner_did, rkey FROM repo_aliases WHERE repo_did = ? ORDER BY rev DESC LIMIT 1",
+        )
+        .bind(repo_did)
+        .fetch_optional(self.pool())
+        .await?;
+
+        match row {
+            Some(r) => {
+                let owner_did: String = r.try_get("owner_did")?;
+                let rkey: String = r.try_get("rkey")?;
+                if owner_did.is_empty() || rkey.is_empty() {
+                    return Err(DbError::RepoNotFound {
+                        owner: owner_did,
+                        name: rkey,
+                    });
+                }
+                Ok((owner_did, rkey))
+            }
+            None => Err(DbError::RepoNotFound {
+                owner: repo_did.to_owned(),
+                name: String::new(),
+            }),
+        }
+    }
+
+    async fn create_repo(
+        &self,
+        repo_did: &str,
+        signing_key: Option<&[u8]>,
+        owner_did: &str,
+        repo_name: &str,
+        key_type: &str,
+    ) -> Result<(), DbError> {
+        let mut tx = self.pool.begin().await?;
+
+        // Insert into repo_keys
+        sqlx::query(
+            "INSERT INTO repo_keys (repo_did, signing_key, owner_did, repo_name, key_type) VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind(repo_did)
+        .bind(signing_key)
+        .bind(owner_did)
+        .bind(repo_name)
+        .bind(key_type)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| {
+            if is_unique_violation(&e) {
+                DbError::RepoAlreadyExists {
+                    owner: owner_did.to_owned(),
+                    name: repo_name.to_owned(),
+                }
+            } else {
+                DbError::Sqlx(e)
+            }
+        })?;
+
+        // Insert initial alias (rev = 0_<now> like Go does)
+        sqlx::query(
+            "INSERT INTO repo_aliases (owner_did, rkey, repo_did, rev) VALUES (?, ?, ?, '0_' || strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))",
+        )
+        .bind(owner_did)
+        .bind(repo_name)
+        .bind(repo_did)
+        .execute(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+        Ok(())
+    }
+
+    async fn delete_repo(&self, repo_did: &str) -> Result<(), DbError> {
+        let mut tx = self.pool.begin().await?;
+
+        sqlx::query("DELETE FROM repo_aliases WHERE repo_did = ?")
+            .bind(repo_did)
+            .execute(&mut *tx)
+            .await?;
+
+        let result = sqlx::query("DELETE FROM repo_keys WHERE repo_did = ?")
+            .bind(repo_did)
+            .execute(&mut *tx)
+            .await?;
+
+        if result.rows_affected() == 0 {
+            return Err(DbError::RepoNotFound {
+                owner: repo_did.to_owned(),
+                name: String::new(),
+            });
+        }
+
+        tx.commit().await?;
+        Ok(())
+    }
+
+    async fn repo_did_exists(&self, repo_did: &str) -> Result<bool, DbError> {
+        let row = sqlx::query("SELECT count(1) as cnt FROM repo_keys WHERE repo_did = ?")
+            .bind(repo_did)
+            .fetch_one(self.pool())
+            .await?;
+
+        let count: i64 = row.try_get("cnt")?;
+        Ok(count > 0)
+    }
+
+    async fn get_public_keys(&self, did: &str) -> Result<Vec<PublicKey>, DbError> {
+        let rows = sqlx::query(
+            "SELECT id, did, key, created FROM public_keys WHERE did = ?",
+        )
+        .bind(did)
+        .fetch_all(self.pool())
+        .await?;
+
+        rows.iter().map(row_to_public_key).collect()
+    }
+
+    async fn get_all_public_keys(&self) -> Result<Vec<PublicKey>, DbError> {
+        let rows = sqlx::query("SELECT id, did, key, created FROM public_keys")
+            .fetch_all(self.pool())
+            .await?;
+
+        rows.iter().map(row_to_public_key).collect()
+    }
+
+    async fn add_public_key(&self, did: &str, key: &str, created: &str) -> Result<(), DbError> {
+        sqlx::query("INSERT OR IGNORE INTO public_keys (did, key, created) VALUES (?, ?, ?)")
+            .bind(did)
+            .bind(key)
+            .bind(created)
+            .execute(self.pool())
+            .await?;
+        Ok(())
+    }
+
+    async fn remove_public_keys(&self, did: &str) -> Result<(), DbError> {
+        sqlx::query("DELETE FROM public_keys WHERE did = ?")
+            .bind(did)
+            .execute(self.pool())
+            .await?;
+        Ok(())
+    }
+
+    async fn add_did(&self, did: &str) -> Result<(), DbError> {
+        sqlx::query("INSERT OR IGNORE INTO known_dids (did) VALUES (?)")
+            .bind(did)
+            .execute(self.pool())
+            .await?;
+        Ok(())
+    }
+
+    async fn remove_did(&self, did: &str) -> Result<(), DbError> {
+        sqlx::query("DELETE FROM known_dids WHERE did = ?")
+            .bind(did)
+            .execute(self.pool())
+            .await?;
+        Ok(())
+    }
+
+    async fn get_all_dids(&self) -> Result<Vec<String>, DbError> {
+        let rows = sqlx::query("SELECT did FROM known_dids")
+            .fetch_all(self.pool())
+            .await?;
+
+        Ok(rows.iter().map(|r| r.try_get("did").unwrap_or_default()).collect())
+    }
+}
+
+fn row_to_public_key(r: &sqlx::sqlite::SqliteRow) -> Result<PublicKey, DbError> {
+    Ok(PublicKey {
+        id: r.try_get("id")?,
+        did: r.try_get("did")?,
+        key: r.try_get("key")?,
+        created: r.try_get("created")?,
+    })
+}
+
+fn is_unique_violation(e: &sqlx::Error) -> bool {
+    if let sqlx::Error::Database(db_err) = e {
+        db_err.message().contains("UNIQUE")
+    } else {
+        false
+    }
+}

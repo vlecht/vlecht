@@ -1,0 +1,24 @@
+[package]
+name = "vlecht"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+tokio.workspace = true
+axum.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+thiserror.workspace = true
+clap.workspace = true
+anyhow = "1"
+mime_guess = "2"
+
+vlecht-db = { path = "../vlecht-db" }
+vlecht-git = { path = "../vlecht-git" }
+russh = { version = "0.61.1", default-features = false, features = ["aws-lc-rs"] }
+rand = "0.10.1"
+
+[dev-dependencies]
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
