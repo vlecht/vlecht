@@ -76,8 +76,8 @@ impl GitRepo {
 
     pub fn init_bare(path: &Path, default_branch: &str) -> Result<Self, GitError> {
         use gix::refs::{
-            Category, Target,
             transaction::{Change, PreviousValue, RefEdit},
+            Category, Target,
         };
 
         let repo = gix::ThreadSafeRepository::init(
@@ -229,7 +229,11 @@ impl GitRepo {
             };
             let obj = entry.object()?;
             let size = if matches!(kind, EntryKindSnapshot::Blob) {
-                Some(obj.try_into_blob().map(|b| b.data.len() as u64).unwrap_or(0))
+                Some(
+                    obj.try_into_blob()
+                        .map(|b| b.data.len() as u64)
+                        .unwrap_or(0),
+                )
             } else {
                 None
             };
@@ -266,11 +270,7 @@ impl GitRepo {
         }
     }
 
-    pub fn diff(
-        &self,
-        base: Option<&str>,
-        head: Option<&str>,
-    ) -> Result<String, GitError> {
+    pub fn diff(&self, base: Option<&str>, head: Option<&str>) -> Result<String, GitError> {
         let head_tree = self.resolve_tree(head)?;
         let base_tree = self.resolve_tree(base)?;
 
@@ -354,11 +354,6 @@ impl GitRepo {
         response.extend_from_slice(pkt_flush());
         Ok(response)
     }
-    // -----------------------------------------------------------------------
-    // receive-pack
-    // -----------------------------------------------------------------------
-    /// Handle a `git-receive-pack` request: parse commands, ingest pack if any, update refs.
-    ///
     // -----------------------------------------------------------------------
     // receive-pack
     // -----------------------------------------------------------------------
@@ -494,10 +489,8 @@ impl GitRepo {
         .map_err(|e| GitError::Gix(format!("re-parse: {e}")))?;
 
         // Resolve ref-deltas again since we need the resolved objects
-        let resolve_iter2 = gix_pack::data::input::LookupRefDeltaObjectsIter::new(
-            pack_iter2,
-            &self.inner,
-        );
+        let resolve_iter2 =
+            gix_pack::data::input::LookupRefDeltaObjectsIter::new(pack_iter2, &self.inner);
 
         for entry_result in resolve_iter2 {
             let entry = entry_result.map_err(|e| GitError::Gix(format!("entry: {e}")))?;
@@ -509,7 +502,8 @@ impl GitRepo {
                 };
                 let decompressed = miniz_oxide::inflate::decompress_to_vec_zlib(compressed)
                     .map_err(|e| GitError::Gix(format!("decompress: {e}")))?;
-                self.inner.write_buf(kind, &decompressed)
+                self.inner
+                    .write_buf(kind, &decompressed)
                     .map_err(|e| GitError::Gix(format!("write: {e}")))?;
             }
         }
@@ -573,10 +567,7 @@ impl GitRepo {
         Ok(())
     }
 
-    fn resolve_tree(
-        &self,
-        ref_name: Option<&str>,
-    ) -> Result<Option<gix::Tree<'_>>, GitError> {
+    fn resolve_tree(&self, ref_name: Option<&str>) -> Result<Option<gix::Tree<'_>>, GitError> {
         match ref_name {
             Some(name) if !name.is_empty() => {
                 let spec = self.inner.rev_parse_single(name)?;
@@ -584,6 +575,148 @@ impl GitRepo {
                 Ok(Some(commit.tree()?))
             }
             _ => Ok(None),
+        }
+    }
+
+    /// Set the default branch by updating HEAD to point to a new branch.
+    pub fn set_default_branch(&self, branch: &str) -> Result<(), GitError> {
+        use gix::refs::{Category, FullName, Target};
+        use gix::refs::transaction::{Change, PreviousValue, RefEdit};
+
+        let sym_ref: FullName =
+            Category::LocalBranch.to_full_name(gix::bstr::BString::from(branch).as_bstr())?;
+        gix::validate::reference::branch_name(sym_ref.as_bstr())?;
+
+        let edit = RefEdit {
+            change: Change::Update {
+                log: Default::default(),
+                expected: PreviousValue::Any,
+                new: Target::Symbolic(sym_ref),
+            },
+            name: FullName::try_from("HEAD")
+                .map_err(|e| GitError::Gix(e.to_string()))?,
+            deref: false,
+        };
+        self.inner.edit_reference(edit)?;
+        Ok(())
+    }
+
+    /// Delete a branch ref by name. Returns Ok even if the branch doesn't exist.
+    pub fn delete_branch(&self, branch: &str) -> Result<(), GitError> {
+        use gix::refs::{Category, FullName};
+        use gix::refs::transaction::{Change, PreviousValue, RefEdit};
+
+        let full_name: FullName =
+            Category::LocalBranch.to_full_name(gix::bstr::BString::from(branch).as_bstr())?;
+
+        let edit = RefEdit {
+            change: Change::Delete {
+                log: gix::refs::transaction::RefLog::AndReference,
+                expected: PreviousValue::Any,
+            },
+            name: full_name,
+            deref: false,
+        };
+
+        // gix returns an error if the ref doesn't exist; swallow it.
+        let _ = self.inner.edit_reference(edit);
+        Ok(())
+    }
+
+    /// Find the merge base between two refs. Returns `None` if no common ancestor.
+    pub fn merge_base(&self, a: &str, b: &str) -> Result<Option<String>, GitError> {
+        let spec_a = self.inner.rev_parse_single(a)?;
+        let oid_a = spec_a.detach();
+        let spec_b = self.inner.rev_parse_single(b)?;
+        let oid_b = spec_b.detach();
+
+        match self.inner.merge_base(oid_a, oid_b) {
+            Ok(id) => Ok(Some(id.detach().to_string())),
+            Err(gix::repository::merge_base::Error::NotFound { .. }) => Ok(None),
+            Err(e) => Err(GitError::Gix(e.to_string())),
+        }
+    }
+
+    /// Check if `ancestor` is an ancestor of `descendant` (i.e., descendant
+    /// contains ancestor in its history).
+    pub fn is_ancestor(&self, ancestor: &str, descendant: &str) -> Result<bool, GitError> {
+        let base = self.merge_base(ancestor, descendant)?;
+        match base {
+            Some(ref base_oid) => {
+                let anc = self.inner.rev_parse_single(ancestor)?;
+                Ok(anc.detach().to_string() == *base_oid)
+            }
+            None => Ok(false),
+        }
+    }
+
+    /// Resolve a revision to its OID string.
+    pub fn resolve_ref(&self, ref_name: &str) -> Result<String, GitError> {
+        let spec = self.inner.rev_parse_single(ref_name)?;
+        Ok(spec.detach().to_string())
+    }
+
+    /// Update a branch ref to point to a new commit (fast-forward).
+    pub fn fast_forward_ref(&self, branch: &str, target_commit: &str) -> Result<(), GitError> {
+        use gix::refs::{Category, FullName};
+        use gix::refs::transaction::{Change, PreviousValue, RefEdit};
+
+        let target = gix_hash::ObjectId::from_hex(target_commit.as_bytes())
+            .map_err(|e| GitError::Gix(e.to_string()))?;
+
+        let full_name: FullName =
+            Category::LocalBranch.to_full_name(gix::bstr::BString::from(branch).as_bstr())?;
+
+        let edit = RefEdit {
+            change: Change::Update {
+                log: Default::default(),
+                expected: PreviousValue::Any,
+                new: gix::refs::Target::Object(target),
+            },
+            name: full_name,
+            deref: false,
+        };
+
+        self.inner.edit_reference(edit)?;
+        Ok(())
+    }
+
+    /// Set a hidden ref in `refs/hidden/<name>`.
+    pub fn set_hidden_ref(&self, name: &str, target_oid: &str) -> Result<(), GitError> {
+        use gix::refs::transaction::{Change, PreviousValue, RefEdit};
+
+        let target = gix_hash::ObjectId::from_hex(target_oid.as_bytes())
+            .map_err(|e| GitError::Gix(e.to_string()))?;
+
+        let refname = format!("refs/hidden/{name}");
+        let full_name: gix::refs::FullName = refname
+            .as_str()
+            .try_into()
+            .map_err(|e: gix::validate::reference::name::Error| GitError::Gix(e.to_string()))?;
+
+        let edit = RefEdit {
+            change: Change::Update {
+                log: Default::default(),
+                expected: PreviousValue::Any,
+                new: gix::refs::Target::Object(target),
+            },
+            name: full_name,
+            deref: false,
+        };
+
+        self.inner.edit_reference(edit)?;
+        Ok(())
+    }
+
+    /// Get the target OID of a hidden ref, if it exists.
+    pub fn get_hidden_ref(&self, name: &str) -> Result<Option<String>, GitError> {
+        let refname = format!("refs/hidden/{name}");
+        match self.inner.try_find_reference(&refname)? {
+            Some(r) => {
+                let oid = r.into_fully_peeled_id().map(|o| o.detach().to_string()).unwrap_or_default();
+                Ok(Some(oid))
+            }
+            None => Ok(None),
         }
     }
 }
@@ -697,7 +830,9 @@ fn split_receive_pack(body: &[u8]) -> Result<(Vec<ReceivePackCommand>, &[u8]), G
     }
 
     if commands.is_empty() {
-        return Err(GitError::Protocol("no commands in receive-pack request".into()));
+        return Err(GitError::Protocol(
+            "no commands in receive-pack request".into(),
+        ));
     }
 
     Ok((commands, &[]))
@@ -798,7 +933,8 @@ fn collect_all_oids(
         }
 
         let commit_obj = repo.find_object(oid)?;
-        let mut commit_iter = gix::objs::CommitRefIter::from_bytes(&commit_obj.data, gix::hash::Kind::Sha1);
+        let mut commit_iter =
+            gix::objs::CommitRefIter::from_bytes(&commit_obj.data, gix::hash::Kind::Sha1);
         let tree_oid = commit_iter.tree_id()?;
 
         oids.push(oid);
@@ -851,9 +987,8 @@ fn generate_pack_bytes(
             id: *oid,
             entry_pack_location: gix_pack::data::output::count::PackLocation::NotLookedUp,
         };
-        let entry = gix_pack::data::output::Entry::from_data(
-            &count, &data,
-        ).map_err(|e| GitError::Gix(format!("pack entry: {e}")))?;
+        let entry = gix_pack::data::output::Entry::from_data(&count, &data)
+            .map_err(|e| GitError::Gix(format!("pack entry: {e}")))?;
         entries.push(entry);
     }
 
@@ -890,7 +1025,13 @@ fn iso8601(time: &gix::date::Time) -> String {
     let h = abs / 3600;
     let m = (abs % 3600) / 60;
     let dt = chrono::DateTime::from_timestamp(time.seconds.into(), 0).unwrap_or_default();
-    format!("{} {}{:02}:{:02}", dt.format("%Y-%m-%dT%H:%M:%S"), sign, h, m)
+    format!(
+        "{} {}{:02}:{:02}",
+        dt.format("%Y-%m-%dT%H:%M:%S"),
+        sign,
+        h,
+        m
+    )
 }
 
 // --- Archive ---
@@ -1001,11 +1142,7 @@ mod tests {
         send_sideband(&mut buf, &data);
         // Each sideband pkt is 4 (len) + 1 (channel) + N (data)
         // First chunk should be 65515 bytes of payload
-        let first_len = usize::from_str_radix(
-            std::str::from_utf8(&buf[..4]).unwrap(),
-            16,
-        )
-        .unwrap();
+        let first_len = usize::from_str_radix(std::str::from_utf8(&buf[..4]).unwrap(), 16).unwrap();
         assert_eq!(first_len, 4 + 1 + 65515);
         assert_eq!(buf[4], 0x01, "channel byte must be 0x01 for pack data");
     }
@@ -1014,11 +1151,7 @@ mod tests {
     fn send_sideband_small_data_in_one_pkt() {
         let mut buf = Vec::new();
         send_sideband(&mut buf, b"abc");
-        let first_len = usize::from_str_radix(
-            std::str::from_utf8(&buf[..4]).unwrap(),
-            16,
-        )
-        .unwrap();
+        let first_len = usize::from_str_radix(std::str::from_utf8(&buf[..4]).unwrap(), 16).unwrap();
         assert_eq!(first_len, 4 + 1 + 3);
         assert_eq!(&buf[5..], b"abc");
     }
@@ -1049,7 +1182,8 @@ mod tests {
     fn upload_pack_request_handles_capabilities_after_want() {
         // "want 9a594a2441c48bb8243f3da7d30df9cfa0ab5caf side-band-64k\n" is 60 bytes
         // 60 + 4 (len prefix) = 64 = 0x40
-        let body = b"0040want 9a594a2441c48bb8243f3da7d30df9cfa0ab5caf side-band-64k\n00000009done\n";
+        let body =
+            b"0040want 9a594a2441c48bb8243f3da7d30df9cfa0ab5caf side-band-64k\n00000009done\n";
         let req = UploadPackRequest::parse(body).unwrap();
         assert_eq!(req.wants.len(), 1);
     }
@@ -1078,4 +1212,3 @@ mod tests {
         assert!(buf.ends_with(b"0000"));
     }
 }
-

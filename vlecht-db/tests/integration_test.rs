@@ -39,7 +39,10 @@ async fn create_and_find_repo() {
         .unwrap();
 
     // Find by alias
-    let alias = db.find_repo_alias("did:plc:alice", "my-repo").await.unwrap();
+    let alias = db
+        .find_repo_alias("did:plc:alice", "my-repo")
+        .await
+        .unwrap();
     assert_eq!(alias.repo_did, "did:plc:repo1");
 
     // Find by name
@@ -102,6 +105,55 @@ async fn public_keys_crud() {
     db.remove_public_keys("did:plc:bob").await.unwrap();
     let keys = db.get_public_keys("did:plc:bob").await.unwrap();
     assert!(keys.is_empty());
+
+    cleanup(&path);
+}
+
+#[tokio::test]
+async fn public_keys_paginated() {
+    let path = test_db_path("pubkeys_paginated");
+    cleanup(&path);
+
+    let db = Db::open(&path).await.unwrap();
+    db.migrate().await.unwrap();
+    db.add_did("did:plc:carol").await.unwrap();
+
+    for i in 0..7 {
+        db.add_public_key(
+            "did:plc:carol",
+            &format!("ssh-ed25519 AAAA-{}", i),
+            "2025-01-01T00:00:00Z",
+        )
+        .await
+        .unwrap();
+    }
+
+    // First page.
+    let page1 = db.get_public_keys_paginated(3, "").await.unwrap();
+    assert_eq!(page1.len(), 3);
+    let last_id = page1.last().unwrap().id;
+
+    // Second page uses the last id from page1 as the cursor.
+    let page2 = db
+        .get_public_keys_paginated(3, &last_id.to_string())
+        .await
+        .unwrap();
+    assert_eq!(page2.len(), 3);
+
+    // Last page: 7 keys total, 3 + 3 + 1.
+    let last_id2 = page2.last().unwrap().id;
+    let page3 = db
+        .get_public_keys_paginated(3, &last_id2.to_string())
+        .await
+        .unwrap();
+    assert_eq!(page3.len(), 1);
+
+    // Invalid cursor string falls back to id=0, which means "from the start".
+    let bad = db
+        .get_public_keys_paginated(3, "not-a-number")
+        .await
+        .unwrap();
+    assert_eq!(bad.len(), 3);
 
     cleanup(&path);
 }

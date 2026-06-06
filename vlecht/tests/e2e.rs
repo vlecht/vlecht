@@ -46,19 +46,28 @@ impl ServerHandle {
             ssh_port: ssh,
         };
 
-        let state = std::sync::Arc::new(vlecht::AppState {
-            db,
-            cfg: std::sync::Arc::new(cfg),
-        });
+        let state = vlecht::build_state(db, std::sync::Arc::new(cfg));
 
         // Generate an ed25519 key pair for SSH tests
         let ssh_key = tmpdir.join("test_ed25519");
         if ssh_port.is_some() {
             let out = Command::new("ssh-keygen")
-                .args(["-t", "ed25519", "-f", ssh_key.to_str().unwrap(), "-N", "", "-q"])
+                .args([
+                    "-t",
+                    "ed25519",
+                    "-f",
+                    ssh_key.to_str().unwrap(),
+                    "-N",
+                    "",
+                    "-q",
+                ])
                 .output()
                 .expect("ssh-keygen should be installed");
-            assert!(out.status.success(), "ssh-keygen failed: {}", String::from_utf8_lossy(&out.stderr));
+            assert!(
+                out.status.success(),
+                "ssh-keygen failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
         }
 
         // SSH server
@@ -87,15 +96,28 @@ impl ServerHandle {
             wait_for_port(ssh_p).await;
         }
 
-        ServerHandle { tmpdir, http_port, ssh_port: ssh, ssh_key }
+        ServerHandle {
+            tmpdir,
+            http_port,
+            ssh_port: ssh,
+            ssh_key,
+        }
     }
 
     fn http_url(&self, owner: &str, repo: &str) -> String {
-        format!("http://127.0.0.1:{}/{}", self.http_port, format!("{}/{}", owner, repo))
+        format!(
+            "http://127.0.0.1:{}/{}",
+            self.http_port,
+            format!("{}/{}", owner, repo)
+        )
     }
 
     fn ssh_url(&self, owner: &str, repo: &str) -> String {
-        format!("ssh://git@127.0.0.1:{}/{}", self.ssh_port, format!("{}/{}", owner, repo))
+        format!(
+            "ssh://git@127.0.0.1:{}/{}",
+            self.ssh_port,
+            format!("{}/{}", owner, repo)
+        )
     }
 
     /// GIT_SSH_COMMAND value that uses the test key and accepts any host key.
@@ -128,8 +150,10 @@ async fn wait_for_port(port: u16) {
         if std::net::TcpStream::connect(sockaddr).is_ok() {
             break;
         }
-        assert!(start.elapsed() < std::time::Duration::from_secs(10),
-                "server did not start on port {port}");
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(10),
+            "server did not start on port {port}"
+        );
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
 }
@@ -138,21 +162,24 @@ async fn wait_for_port(port: u16) {
 
 fn git_global_config() -> Vec<&'static str> {
     vec![
-        "-c", "user.email=test@test",
-        "-c", "user.name=Test",
-        "-c", "commit.gpgsign=false",
-        "-c", "tag.gpgsign=false",
-        "-c", "protocol.version=2",
-        "-c", "credential.helper=",
+        "-c",
+        "user.email=test@test",
+        "-c",
+        "user.name=Test",
+        "-c",
+        "commit.gpgsign=false",
+        "-c",
+        "tag.gpgsign=false",
+        "-c",
+        "protocol.version=2",
+        "-c",
+        "credential.helper=",
     ]
 }
 
 /// Extra git config for SSH connections: accept any host key, disable strict checking.
 fn git_ssh_config() -> Vec<&'static str> {
-    vec![
-        "-c", "ssh.variant=ssh",
-        "-c", "protocol.version=0",
-    ]
+    vec!["-c", "ssh.variant=ssh", "-c", "protocol.version=0"]
 }
 
 fn git(repo: &Path, args: &[&str]) {
@@ -207,7 +234,9 @@ fn git_output(repo: &Path, args: &[&str]) -> String {
 async fn e2e_healthcheck() {
     let port = unique_port();
     let _server = ServerHandle::start(port, None).await;
-    let resp = reqwest::get(&format!("http://127.0.0.1:{port}/")).await.unwrap();
+    let resp = reqwest::get(&format!("http://127.0.0.1:{port}/"))
+        .await
+        .unwrap();
     assert_eq!(resp.status(), 200);
     assert_eq!(resp.text().await.unwrap(), "ok");
 }
@@ -227,14 +256,20 @@ async fn e2e_git_clone() {
     std::fs::write(src.join("README.md"), "hello clone\n").unwrap();
     git(&src, &["add", "."]);
     git(&src, &["commit", "-m", "initial"]);
-    git(&src, &["remote", "add", "origin", repo_path.to_str().unwrap()]);
+    git(
+        &src,
+        &["remote", "add", "origin", repo_path.to_str().unwrap()],
+    );
     git(&src, &["push", "origin", "main"]);
 
     // Clone via HTTP
     let dest = wd.join("clone");
     let remote = format!("http://127.0.0.1:{port}/alice/myrepo");
     git(&wd, &["clone", &remote, dest.to_str().unwrap()]);
-    assert_eq!(std::fs::read_to_string(dest.join("README.md")).unwrap(), "hello clone\n");
+    assert_eq!(
+        std::fs::read_to_string(dest.join("README.md")).unwrap(),
+        "hello clone\n"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -275,7 +310,15 @@ async fn e2e_git_push_two_commits() {
     std::fs::write(local.join("a.txt"), "a\n").unwrap();
     git(&local, &["add", "."]);
     git(&local, &["commit", "-m", "first"]);
-    git(&local, &["remote", "add", "origin", format!("http://127.0.0.1:{port}/alice/twopush").as_str()]);
+    git(
+        &local,
+        &[
+            "remote",
+            "add",
+            "origin",
+            format!("http://127.0.0.1:{port}/alice/twopush").as_str(),
+        ],
+    );
     git(&local, &["push", "origin", "main"]);
 
     std::fs::write(local.join("b.txt"), "b\n").unwrap();
@@ -307,7 +350,10 @@ async fn e2e_git_ls_remote() {
     git(&local, &["push", "origin", "main"]);
 
     let output = git_output(&local, &["ls-remote", &remote]);
-    assert!(output.contains("refs/heads/main"), "ls-remote output: {output}");
+    assert!(
+        output.contains("refs/heads/main"),
+        "ls-remote output: {output}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -358,19 +404,32 @@ async fn e2e_git_push_delete_branch() {
     git(&local, &["push", "origin", "main"]);
     git(&local, &["push", "origin", "main:to-delete"]);
     // Verify the branch was created
-    let branches = vlecht_git::GitRepo::open(&repo_path).unwrap().branches().unwrap();
+    let branches = vlecht_git::GitRepo::open(&repo_path)
+        .unwrap()
+        .branches()
+        .unwrap();
     let branch_names: Vec<_> = branches.iter().map(|b| b.name.as_str()).collect();
-    assert!(branch_names.contains(&"to-delete"), "branches before delete: {:?}", branch_names);
+    assert!(
+        branch_names.contains(&"to-delete"),
+        "branches before delete: {:?}",
+        branch_names
+    );
     assert_eq!(branches.len(), 2);
 
     // Delete: retry with diagnostics
     std::thread::sleep(std::time::Duration::from_millis(200));
     let ls = git_output(&local, &["ls-remote", "--refs", &remote]);
-    assert!(ls.contains("to-delete"), "to-delete should appear in ls-remote before delete\n{ls}");
+    assert!(
+        ls.contains("to-delete"),
+        "to-delete should appear in ls-remote before delete\n{ls}"
+    );
     // Delete with full refspec
     git(&local, &["push", "origin", ":refs/heads/to-delete"]);
 
-    let branches = vlecht_git::GitRepo::open(&repo_path).unwrap().branches().unwrap();
+    let branches = vlecht_git::GitRepo::open(&repo_path)
+        .unwrap()
+        .branches()
+        .unwrap();
     assert_eq!(branches.len(), 1);
     assert_eq!(branches[0].name, "main");
 }
@@ -395,7 +454,10 @@ async fn e2e_git_pull_after_push() {
 
     let clone_dir = wd.join("clone");
     git(&wd, &["clone", &remote, clone_dir.to_str().unwrap()]);
-    assert_eq!(std::fs::read_to_string(clone_dir.join("f.txt")).unwrap(), "v1\n");
+    assert_eq!(
+        std::fs::read_to_string(clone_dir.join("f.txt")).unwrap(),
+        "v1\n"
+    );
 
     std::fs::write(local.join("f.txt"), "v2\n").unwrap();
     git(&local, &["add", "."]);
@@ -403,7 +465,10 @@ async fn e2e_git_pull_after_push() {
     git(&local, &["push", "origin", "main"]);
 
     git(&clone_dir, &["pull", &remote, "main"]);
-    assert_eq!(std::fs::read_to_string(clone_dir.join("f.txt")).unwrap(), "v2\n");
+    assert_eq!(
+        std::fs::read_to_string(clone_dir.join("f.txt")).unwrap(),
+        "v2\n"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -421,7 +486,15 @@ async fn e2e_browse_api() {
     std::fs::write(local.join("src/main.rs"), "fn main() {}\n").unwrap();
     git(&local, &["add", "."]);
     git(&local, &["commit", "-m", "init"]);
-    git(&local, &["remote", "add", "origin", format!("http://127.0.0.1:{port}/alice/browse").as_str()]);
+    git(
+        &local,
+        &[
+            "remote",
+            "add",
+            "origin",
+            format!("http://127.0.0.1:{port}/alice/browse").as_str(),
+        ],
+    );
     git(&local, &["push", "origin", "main"]);
 
     let base = format!("http://127.0.0.1:{port}/alice/browse");
@@ -439,7 +512,9 @@ async fn e2e_browse_api() {
     let arr = val.as_array().unwrap();
     assert!(arr.iter().any(|e| e["name"] == "README.md"));
 
-    let resp = reqwest::get(format!("{base}/blob/README.md")).await.unwrap();
+    let resp = reqwest::get(format!("{base}/blob/README.md"))
+        .await
+        .unwrap();
     assert_eq!(resp.status(), 200);
     assert_eq!(resp.text().await.unwrap(), "browse me\n");
 }
@@ -479,12 +554,19 @@ async fn e2e_create_and_push_to_new_repo() {
     std::fs::write(local.join("data.txt"), "created via API\n").unwrap();
     git(&local, &["add", "."]);
     git(&local, &["commit", "-m", "first"]);
-    git(&local, &["remote", "add", "origin", format!("http://127.0.0.1:{port}/bob/newrepo").as_str()]);
+    git(
+        &local,
+        &[
+            "remote",
+            "add",
+            "origin",
+            format!("http://127.0.0.1:{port}/bob/newrepo").as_str(),
+        ],
+    );
     git(&local, &["push", "origin", "main"]);
 
-    let repo = vlecht_git::GitRepo::open(
-        &server.tmpdir.join("repos").join("bob").join("newrepo"),
-    ).unwrap();
+    let repo =
+        vlecht_git::GitRepo::open(&server.tmpdir.join("repos").join("bob").join("newrepo")).unwrap();
     let commits = repo.commits("main", 0, 10).unwrap();
     assert_eq!(commits.len(), 1);
     assert!(commits[0].message.contains("first"));
@@ -560,13 +642,27 @@ async fn ssh_git_clone() {
     std::fs::write(src.join("README.md"), "hello ssh\n").unwrap();
     git(&src, &["add", "."]);
     git(&src, &["commit", "-m", "initial"]);
-    git(&src, &["remote", "add", "origin", repo_path.to_str().unwrap()]);
+    git(
+        &src,
+        &["remote", "add", "origin", repo_path.to_str().unwrap()],
+    );
     git(&src, &["push", "origin", "main"]);
 
     // Clone via SSH
     let dest = wd.join("clone");
-    git_ssh(&wd, &["clone", &server.ssh_url("alice", "myrepo"), dest.to_str().unwrap()], &ssh_cmd);
-    assert_eq!(std::fs::read_to_string(dest.join("README.md")).unwrap(), "hello ssh\n");
+    git_ssh(
+        &wd,
+        &[
+            "clone",
+            &server.ssh_url("alice", "myrepo"),
+            dest.to_str().unwrap(),
+        ],
+        &ssh_cmd,
+    );
+    assert_eq!(
+        std::fs::read_to_string(dest.join("README.md")).unwrap(),
+        "hello ssh\n"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -585,7 +681,16 @@ async fn ssh_git_push() {
     git(&local, &["add", "."]);
     git(&local, &["commit", "-m", "first push"]);
 
-    git_ssh(&local, &["remote", "add", "origin", &server.ssh_url("alice", "pushrepo")], &ssh_cmd);
+    git_ssh(
+        &local,
+        &[
+            "remote",
+            "add",
+            "origin",
+            &server.ssh_url("alice", "pushrepo"),
+        ],
+        &ssh_cmd,
+    );
     git_ssh(&local, &["push", "origin", "main"], &ssh_cmd);
 
     let repo = vlecht_git::GitRepo::open(&repo_path).unwrap();
@@ -609,7 +714,16 @@ async fn ssh_git_push_two_commits() {
     std::fs::write(local.join("a.txt"), "a\n").unwrap();
     git(&local, &["add", "."]);
     git(&local, &["commit", "-m", "first"]);
-    git_ssh(&local, &["remote", "add", "origin", &server.ssh_url("alice", "twopush")], &ssh_cmd);
+    git_ssh(
+        &local,
+        &[
+            "remote",
+            "add",
+            "origin",
+            &server.ssh_url("alice", "twopush"),
+        ],
+        &ssh_cmd,
+    );
     git_ssh(&local, &["push", "origin", "main"], &ssh_cmd);
 
     std::fs::write(local.join("b.txt"), "b\n").unwrap();
@@ -643,7 +757,10 @@ async fn ssh_git_ls_remote() {
     git_ssh(&local, &["push", "origin", "main"], &ssh_cmd);
 
     let output = git_ssh_output(&local, &["ls-remote", &remote], &ssh_cmd);
-    assert!(output.contains("refs/heads/main"), "ls-remote output: {output}");
+    assert!(
+        output.contains("refs/heads/main"),
+        "ls-remote output: {output}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -662,7 +779,16 @@ async fn ssh_git_push_new_branch() {
     git(&local, &["add", "."]);
     git(&local, &["commit", "-m", "init"]);
 
-    git_ssh(&local, &["remote", "add", "origin", &server.ssh_url("alice", "newbranch")], &ssh_cmd);
+    git_ssh(
+        &local,
+        &[
+            "remote",
+            "add",
+            "origin",
+            &server.ssh_url("alice", "newbranch"),
+        ],
+        &ssh_cmd,
+    );
     git_ssh(&local, &["push", "origin", "main"], &ssh_cmd);
     git(&local, &["checkout", "-b", "feature"]);
     std::fs::write(local.join("feat.txt"), "feat\n").unwrap();
@@ -698,15 +824,29 @@ async fn ssh_git_push_delete_branch() {
     git_ssh(&local, &["push", "origin", "main:to-delete"], &ssh_cmd);
 
     // Verify the branch was created
-    let branches = vlecht_git::GitRepo::open(&repo_path).unwrap().branches().unwrap();
+    let branches = vlecht_git::GitRepo::open(&repo_path)
+        .unwrap()
+        .branches()
+        .unwrap();
     let branch_names: Vec<_> = branches.iter().map(|b| b.name.as_str()).collect();
-    assert!(branch_names.contains(&"to-delete"), "branches before delete: {:?}", branch_names);
+    assert!(
+        branch_names.contains(&"to-delete"),
+        "branches before delete: {:?}",
+        branch_names
+    );
     assert_eq!(branches.len(), 2);
 
     // Delete
-    git_ssh(&local, &["push", "origin", ":refs/heads/to-delete"], &ssh_cmd);
+    git_ssh(
+        &local,
+        &["push", "origin", ":refs/heads/to-delete"],
+        &ssh_cmd,
+    );
 
-    let branches = vlecht_git::GitRepo::open(&repo_path).unwrap().branches().unwrap();
+    let branches = vlecht_git::GitRepo::open(&repo_path)
+        .unwrap()
+        .branches()
+        .unwrap();
     assert_eq!(branches.len(), 1);
     assert_eq!(branches[0].name, "main");
 }
@@ -731,8 +871,15 @@ async fn ssh_git_pull_after_push() {
     git_ssh(&local, &["push", "origin", "main"], &ssh_cmd);
 
     let clone_dir = wd.join("clone");
-    git_ssh(&wd, &["clone", &remote, clone_dir.to_str().unwrap()], &ssh_cmd);
-    assert_eq!(std::fs::read_to_string(clone_dir.join("f.txt")).unwrap(), "v1\n");
+    git_ssh(
+        &wd,
+        &["clone", &remote, clone_dir.to_str().unwrap()],
+        &ssh_cmd,
+    );
+    assert_eq!(
+        std::fs::read_to_string(clone_dir.join("f.txt")).unwrap(),
+        "v1\n"
+    );
 
     std::fs::write(local.join("f.txt"), "v2\n").unwrap();
     git(&local, &["add", "."]);
@@ -740,5 +887,43 @@ async fn ssh_git_pull_after_push() {
     git_ssh(&local, &["push", "origin", "main"], &ssh_cmd);
 
     git_ssh(&clone_dir, &["pull", &remote, "main"], &ssh_cmd);
-    assert_eq!(std::fs::read_to_string(clone_dir.join("f.txt")).unwrap(), "v2\n");
+    assert_eq!(
+        std::fs::read_to_string(clone_dir.join("f.txt")).unwrap(),
+        "v2\n"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// ATproto XRPC smoke tests.
+//
+// These verify the read-side XRPC endpoints are reachable from the same
+// vlecht server that handles git traffic. The contract tests live in
+// `vlecht-atp/tests/xrpc.rs`; here we just confirm the wiring.
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_xrpc_version_reachable() {
+    let port = unique_port();
+    let _server = ServerHandle::start(port, None).await;
+    let resp = reqwest::get(&format!(
+        "http://127.0.0.1:{port}/xrpc/sh.tangled.knot.version"
+    ))
+    .await
+    .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert!(body["version"].is_string());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_xrpc_branches_returns_repo_branches() {
+    let port = unique_port();
+    let server = ServerHandle::start(port, None).await;
+    let _repo = server.init_repo("alice", "xrpc-smoke");
+    let resp = reqwest::get(&format!(
+        "http://127.0.0.1:{port}/xrpc/sh.tangled.repo.branches?repo=alice/xrpc-smoke"
+    ))
+    .await
+    .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert!(body["branches"].is_array());
 }

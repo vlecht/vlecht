@@ -16,13 +16,15 @@
 
 ```
 vlecht/
-├── vlecht/             # binary: CLI, config, Axum server, handlers, routing
+├── vlecht/             # binary+lib: CLI, config, Axum server, handlers, routing, SSH, auth
 ├── vlecht-git/          # git repository abstraction (pure gix — no git binary)
-├── vlecht-db/           # database access via sqlx (SQLite initially, Postgres/MySQL later)
+├── vlecht-db/           # database access via sqlx (SQLite, sqlx-managed migrations)
+├── vlecht-atp/          # AT Protocol: XRPC endpoints, identity resolution, did:web, service auth
+├── gix-hash-patched/   # patched gix-hash with extra derives (workspace patch override)
 └── Cargo.toml          # workspace root
 ```
 
-**Why 3 crates instead of 7:** Fewer boundaries to maintain during early iterations. Split further only when it hurts. `vlecht` absorbs config and server; `vlecht-atp`, `vlecht-rbac`, and `tangled-lexicons` are post-MVP.
+`vlecht` is a lib+bin hybrid — `build_app()` is re-exported from the library so integration tests can spawn the router in-process. `vlecht-atp` is the AT Protocol integration crate, added in Phase 4.
 
 ---
 
@@ -40,7 +42,7 @@ vlecht/
 | Config | `config` + `serde` | Layered: file → env → defaults. |
 | CLI | `clap` | Commands: `server`, `migrate`. |
 | Error handling | `thiserror` | Typed errors per module. |
-| AT Protocol | `jacquard` | Identity (`jacquard-identity`), OAuth (`jacquard-oauth`), repo primitives (`jacquard-repo`), XRPC (`jacquard-api`). Required for drop-in knotserver parity. |
+| AT Protocol | `jacquard` | Identity (`jacquard-identity`), OAuth (`jacquard-oauth`), DID document types (`jacquard-common`), service auth middleware (`jacquard-axum`). Required for drop-in knotserver parity. |
 
 ---
 
@@ -48,37 +50,66 @@ vlecht/
 
 ### 4.1 `vlecht-db`
 
-**Multi-backend strategy:** Use `sqlx`'s `Any` driver for queries that work across SQLite/Postgres/MySQL. For backend-specific queries (like `strftime`), isolate behind a `DbBackend` trait or use `#[cfg]`-gated query files. Start SQLite-only; design the trait boundary from day one.
+**Multi-backend strategy:** SQL access is isolated behind the `RepoStore` trait (in `vlecht-db/src/store.rs`). All other crates call `RepoStore` methods — no raw SQL outside `vlecht-db`. The current impl is SQLite; Postgres/MySQL backends implement the same trait.
 
-**Schema (MVP):**
+**Schema (drop-in compatible with the Go knotserver):**
 
 ```sql
--- repos: bare repositories tracked by this knot
-CREATE TABLE repos (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    owner TEXT NOT NULL,          -- DID or username
-    name TEXT NOT NULL,
-    path TEXT NOT NULL UNIQUE,    -- absolute path on disk
-    default_branch TEXT NOT NULL DEFAULT 'main',
-    created_at TEXT NOT NULL,
-    UNIQUE(owner, name)
+-- DIDs known to this knot (FK target for public_keys)
+CREATE TABLE known_dids (
+    did TEXT PRIMARY KEY
 );
 
--- public_keys: SSH keys for push auth (MVP: simple key list, no DID resolution)
+-- SSH / signing public keys per DID
 CREATE TABLE public_keys (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    owner TEXT NOT NULL,
+    did TEXT NOT NULL,
     key TEXT NOT NULL,
-    created_at TEXT NOT NULL,
-    UNIQUE(owner, key)
+    created TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+    UNIQUE(did, key),
+    FOREIGN KEY (did) REFERENCES known_dids(did) ON DELETE CASCADE
 );
 
--- migrations tracking (sqlx managed)
+-- Repo signing keys (AT Protocol repo identity)
+CREATE TABLE repo_keys (
+    repo_did    TEXT PRIMARY KEY,
+    signing_key BLOB,
+    created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+    owner_did   TEXT,
+    repo_name   TEXT,
+    key_type    TEXT NOT NULL DEFAULT 'k256'
+);
+CREATE UNIQUE INDEX idx_repo_keys_owner_repo ON repo_keys(owner_did, repo_name);
+
+-- owner/rkey → repo_did aliases (multiple per repo, newest-first by rev)
+CREATE TABLE repo_aliases (
+    owner_did TEXT NOT NULL,
+    rkey      TEXT NOT NULL,
+    repo_did  TEXT NOT NULL,
+    rev       TEXT NOT NULL,
+    PRIMARY KEY (owner_did, rkey)
+);
+CREATE INDEX idx_repo_aliases_repo_did ON repo_aliases(repo_did);
+
+-- Knot member registry
+CREATE TABLE knot_members (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    did TEXT NOT NULL,
+    rkey TEXT NOT NULL,
+    subject TEXT NOT NULL,
+    created TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+    UNIQUE (did, rkey)
+);
+
+-- Jetstream cursor + internal events (future Phase 4c)
+CREATE TABLE _jetstream (id INTEGER PRIMARY KEY AUTOINCREMENT, last_time_us INTEGER NOT NULL);
+CREATE TABLE events (rkey TEXT NOT NULL, nsid TEXT NOT NULL, event TEXT NOT NULL, created INTEGER NOT NULL, PRIMARY KEY (rkey, nsid));
 ```
 
-**Key queries:**
-- `find_repo_by_owner_name`, `list_repos`, `create_repo`, `delete_repo`
-- `find_keys_for_owner`, `add_key`, `remove_key`
+**Key queries (via `RepoStore` trait):**
+- `find_repo_alias`, `get_repo_did_by_name`, `get_repo_key_owner`, `create_repo`, `delete_repo`, `repo_did_exists`
+- `get_public_keys`, `get_public_keys_paginated`, `get_all_public_keys`, `add_public_key`, `remove_public_keys`
+- `add_did`, `remove_did`, `get_all_dids`
 
 ### 4.2 `vlecht-git`
 
@@ -129,8 +160,9 @@ impl GitRepo {
 | `GET /{owner}/{repo}/info/refs?service=git-receive-pack` | `info_refs` | git push handshake (advertises `report-status report-status-v2 delete-refs side-band-64k`) |
 | `POST /{owner}/{repo}/git-upload-pack` | `upload_pack` | git clone/pull data |
 | `POST /{owner}/{repo}/git-receive-pack` | `receive_pack` | git push (pure gix: thin-pack resolution + ref updates) |
-| `GET /{owner}/{repo}/tree/{*path}` | `tree` | browse files |
-| `GET /{owner}/{repo}/log/{*ref}` | `log` | commit history |
+| `GET /{owner}/{repo}/tree` | `tree_root` | browse root directory |
+| `GET /{owner}/{repo}/tree/{*path}` | `tree_at` | browse subdirectory |
+| `GET /{owner}/{repo}/log/{*refname}` | `log` | commit history |
 | `GET /{owner}/{repo}/blob/{*path}` | `blob` | raw file content |
 | `GET /{owner}/{repo}/branches` | `branches` | branch list |
 | `GET /{owner}/{repo}/tags` | `tags` | tag list |
@@ -139,14 +171,29 @@ impl GitRepo {
 | `POST /api/repos` | `create_repo` | create bare repo |
 | `DELETE /api/repos/{owner}/{repo}` | `delete_repo` | delete bare repo |
 
-**Auth (MVP):** No service auth or RBAC yet. Push auth via SSH keys stored in `public_keys` table. Read operations are public.
+**AT Protocol routes (mounted by vlecht, implemented in `vlecht-atp`):**
+
+| Route | Notes |
+|-------|-------|
+| `/.well-known/did.json` | `did:web` DID document; 404 when `VLECHT_ATP_AUDIENCE_DID` is unset |
+| `/xrpc/sh.tangled.knot.*` | version, listKeys (paginated) |
+| `/xrpc/sh.tangled.repo.*` | describeRepo, branches, branch, tags, tag, tree, log, blob, diff, compare, archive, getDefaultBranch, languages |
+| `/xrpc/sh.tangled.owner` | server owner DID |
+
+**AT Protocol config (env vars):**
+- `VLECHT_ATP_AUDIENCE_DID` — this knot's DID (empty = ATproto disabled)
+- `VLECHT_ATP_SERVICE_KEY_PATH` — multikey file path (default `./vlecht-service-key.multikey`)
+- `VLECHT_ATP_OWNER_DID` — surfaced by `sh.tangled.owner`; 500 if unset
+- `VLECHT_ATP_PLC_URL` — PLC directory URL (default `https://plc.directory`)
+
+**Auth (MVP):** `AuthMode::Proxy` — when `VLECHT_AUTH_MODE=proxy` is set, write routes (`git-receive-pack`, `POST /api/repos`, `DELETE /api/repos/*`) go through `auth::require_auth` middleware which reads a DID from `VLECHT_AUTH_DID_HEADER` (default `X-Vlecht-DID`). Push auth checks the DID owns the target repo. Read operations are always public. Disabled by default (`AuthMode::Disabled`).
 
 ---
 
 ## 5. Implementation Phases
 
 ### Phase 0: Skeleton ✅ DONE
-- [x] Workspace `Cargo.toml` with 3 crates.
+- [x] Workspace `Cargo.toml` with 4 crates (`vlecht`, `vlecht-git`, `vlecht-db`, `vlecht-atp`).
 - [x] `vlecht-config` env var parsing.
 - [x] `vlecht-db` schema + migrations.
 - [x] `vlecht` starts, binds a port, serves `GET /` healthcheck.
@@ -179,17 +226,86 @@ impl GitRepo {
 
 ### Phase 4: AT Protocol Integration → Drop-in Knotserver Parity
 
-**Why:** The Go knotserver is an ATproto application. Without ATproto identity, OAuth, and DID resolution, vlecht cannot authenticate users or interoperate with the Tangled appview / PDS ecosystem. `jacquard` provides the building blocks; the work is wiring them into vlecht's auth and event layers.
+**What the Go knotserver actually does (audited from source):**
 
-- [ ] Replace `AuthMode::Proxy` header hack with real DID resolution (`jacquard-identity`).
-- [ ] Server-side OAuth token validation (`jacquard-axum` extractors or `jacquard-oauth`).
-- [ ] Push auth: verify user's DID owns the repo before accepting `git-receive-pack`.
-- [ ] Firehose/Jetstream consumer: subscribe to `#commit` events, filter for tangled git refs.
-- [ ] XRPC server: implement `tangled.git.*` lexicons so other ATproto apps can query repos.
-- [ ] Repo sync: on push, write git state back to the user's ATproto repo.
-- [ ] Define `tangled.git.*` lexicon schema and generate types with `jacquard-lexgen`.
+The Go server exposes two categories of routes:
 
-**Goal:** vlecht can replace the Go knotserver in a production Tangled deployment.
+1. **Git HTTP** — `info/refs`, `git-upload-pack`, `git-upload-archive`. Notably, `git-receive-pack` over HTTP is **always rejected with 403** — the Go server tells users to push over SSH. Vlecht goes *beyond* the Go server by supporting HTTP pushes.
+
+2. **XRPC endpoints** — read-side (public) and write-side (protected by `ServiceAuth.VerifyServiceAuth` middleware). The middleware validates AT Protocol service auth tokens and extracts the caller's DID.
+
+**What the appview/PDS actually calls (write-side):**
+
+| Endpoint | Purpose | Priority |
+|----------|---------|----------|
+| `sh.tangled.repo.create` | Create a bare repo (handles did:plc auto-gen, did:web, forking) | **Required** |
+| `sh.tangled.repo.delete` | Delete a repo | **Required** |
+| `sh.tangled.repo.setDefaultBranch` | Change the default branch | **Required** |
+| `sh.tangled.repo.deleteBranch` | Delete a branch | **Required** |
+| `sh.tangled.repo.merge` | Execute a merge | Nice-to-have |
+| `sh.tangled.repo.mergeCheck` | Check if merge is clean (public, no auth!) | Nice-to-have |
+| `sh.tangled.repo.forkStatus` | Fork sync state | Nice-to-have |
+| `sh.tangled.repo.forkSync` | Sync fork from upstream | Nice-to-have |
+| `sh.tangled.repo.hiddenRef` | Track hidden remote refs (fork internals) | Nice-to-have |
+
+**What's NOT needed for drop-in (audited from Go source):**
+
+- **Casbin RBAC** — The Go server uses Casbin for multi-user permissions, collaborators, etc. Vlecht uses a simpler owner-DID model via `VLECHT_ATP_OWNER_DID` and `AuthMode::Proxy`. For single-owner repos (the MVP target), this is sufficient.
+- **Internal Guard API** (`/guard`, `/push-allowed`, `/hooks/post-receive`) — Internal HTTP API for SSH-level auth and post-receive pipeline triggers. Vlecht's SSH server handles auth natively in `russh`.
+- **Jetstream consumer** — Subscribes to `#commit` events for auto-discovering new repos and key rotation. Not needed for serving git traffic.
+- **SSE /events endpoint** — Real-time event stream for the appview UI. Not needed for serving git traffic.
+- **Pipeline/workflow triggers** — CI/CD compilation from `.tangled/workflows/`. Post-MVP.
+
+**4a — XRPC read endpoints + identity ✅ DONE**
+- [x] Add `vlecht-atp` crate with dependencies on `jacquard-identity`, `jacquard-axum`, `jacquard-common` (all 0.11).
+- [x] Mount `sh.tangled.*` XRPC query endpoints under `/xrpc/...`:
+  - [x] `sh.tangled.knot.version`
+  - [x] `sh.tangled.owner`
+  - [x] `sh.tangled.knot.listKeys` (paginated)
+  - [x] `sh.tangled.repo.describeRepo`
+  - [x] `sh.tangled.repo.branches` / `branch`
+  - [x] `sh.tangled.repo.tags` / `tag`
+  - [x] `sh.tangled.repo.tree`
+  - [x] `sh.tangled.repo.log`
+  - [x] `sh.tangled.repo.blob` (text + base64 binary, `raw=true` for octet-stream)
+  - [x] `sh.tangled.repo.diff` / `compare`
+  - [x] `sh.tangled.repo.archive` (tar.gz, zip)
+  - [x] `sh.tangled.repo.getDefaultBranch`
+  - [x] `sh.tangled.repo.languages` (stub; needs `enry`/`tokei`)
+- [x] XRPC error envelope (`{"error": "<Tag>", "message": "..."}`) matching Go server.
+- [x] 34 integration tests in `vlecht-atp/tests/xrpc.rs` pinning the contracts.
+- [x] `did:web` DID document served at `/.well-known/did.json`. Reads public key from `VLECHT_ATP_SERVICE_KEY_PATH` (multikey multibase), constructs `DidDocument` with `verificationMethod`, returns `application/did+json`. 404 when ATproto is disabled.
+
+**4b — Service auth + core write endpoints ✅ DONE**
+
+- [x] Wire `jacquard-axum::service_auth::service_auth_middleware` to validate AT Protocol service auth tokens (replaces `AuthMode::Proxy` header hack with real DID resolution).
+- [x] Create protected XRPC router with service auth middleware applied.
+- [x] Implement `sh.tangled.repo.create` — create a bare repo (init, DB alias + repo_key, basic validation).
+- [x] Implement `sh.tangled.repo.delete` — delete repo (disk + DB).
+- [x] Implement `sh.tangled.repo.setDefaultBranch` — HEAD symref update.
+- [x] Implement `sh.tangled.repo.deleteBranch` — delete a ref with auth check.
+- [x] Tests for each write endpoint (9 tests: create, create-duplicate, create-invalid-name, delete, delete-not-found, setDefaultBranch, deleteBranch, deleteBranch-default-rejected, unauthorized).
+- [x] `MaybeAuth` extractor: resolves DID from `VerifiedServiceAuth` extensions (production) or `LexState.dev_did` (dev/test bypass via `VLECHT_ATP_DEV_DID`).
+- [x] `vlecht-git`: added `set_default_branch()` and `delete_branch()` methods.
+
+**4c — Remaining write endpoints + nice-to-haves ✅ DONE**
+
+- [x] `sh.tangled.repo.mergeCheck` — compute merge base, check for fast-forward/conflict. Public, no auth.
+- [x] `sh.tangled.repo.merge` — fast-forward merge (non-FF returns error in MVP). Protected.
+- [x] `sh.tangled.repo.forkStatus` — resolve fork branch + hidden upstream ref, report status (0=UpToDate, 1=FastForwardable, 2=Conflict). Protected.
+- [x] `sh.tangled.repo.forkSync` — fast-forward fork branch to tracked upstream ref. Protected.
+- [x] `sh.tangled.repo.hiddenRef` — create/update hidden ref in `refs/hidden/<name>`. Protected.
+- [x] `vlecht-git`: added `merge_base()`, `is_ancestor()`, `resolve_ref()`, `fast_forward_ref()`, `set_hidden_ref()`, `get_hidden_ref()` methods.
+- [x] 4 integration tests (mergeCheck FF, merge FF, hiddenRef, forkStatus).
+
+**Post-MVP remaining:**
+
+- [ ] Jetstream consumer (auto-discover repos and keys from AT Protocol firehose).
+- [ ] SSE events endpoint.
+- [ ] Non-fast-forward merge support (tree-level merge via gix `merge_commits()`).
+- [ ] Full fork workflow (fetch from remote upstream).
+
+**Goal:** vlecht exposes all 8 write XRPC endpoints the Go knotserver protects behind `ServiceAuth.VerifyServiceAuth`. In production, `jacquard-axum::service_auth_middleware` validates real AT Protocol tokens. In dev/test, `VLECHT_ATP_DEV_DID` bypasses auth. Total: **47 integration tests, 0 failures**.
 
 ---
 

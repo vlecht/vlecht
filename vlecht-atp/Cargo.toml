@@ -1,27 +1,28 @@
 [package]
-name = "vlecht"
+name = "vlecht-atp"
 version.workspace = true
 edition.workspace = true
 
 [dependencies]
 tokio.workspace = true
 axum.workspace = true
-serde.workspace = true
+serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 tracing.workspace = true
-tracing-subscriber.workspace = true
 thiserror.workspace = true
-clap.workspace = true
 anyhow = "1"
+base64 = "0.22"
 mime_guess = "2"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 
+jacquard-axum = "0.11"
+jacquard-identity = "0.11"
+jacquard-common = { version = "0.11", features = ["crypto-k256", "service-auth"] }
 vlecht-db = { path = "../vlecht-db" }
 vlecht-git = { path = "../vlecht-git" }
-vlecht-atp = { path = "../vlecht-atp" }
-jacquard-identity = "0.11"
-russh = { version = "0.61.1", default-features = false, features = ["aws-lc-rs"] }
-rand = "0.10.1"
 
 [dev-dependencies]
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+tempfile = "3"
+base64 = "0.22"
+vlecht = { path = "../vlecht" }

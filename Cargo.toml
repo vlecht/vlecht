@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["vlecht", "vlecht-db", "vlecht-git"]
+members = ["vlecht", "vlecht-atp", "vlecht-db", "vlecht-git"]
 
 [workspace.package]
 version = "0.1.0"

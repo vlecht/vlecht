@@ -40,10 +40,7 @@ async fn main() -> anyhow::Result<()> {
             db.migrate().await?;
             tracing::info!("database ready");
 
-            let state = Arc::new(vlecht::AppState {
-                db,
-                cfg: Arc::new(cfg),
-            });
+            let state = vlecht::build_state(db, Arc::new(cfg));
 
             let ssh_port = state.cfg.ssh_port;
             let listen_addr = state.cfg.listen_addr.clone();

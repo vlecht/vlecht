@@ -18,10 +18,7 @@ pub async fn run_ssh_server(
     state: Arc<AppState>,
     port: u16,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let key = russh::keys::PrivateKey::random(
-        &mut rand::rng(),
-        russh::keys::Algorithm::Ed25519,
-    )?;
+    let key = russh::keys::PrivateKey::random(&mut rand::rng(), russh::keys::Algorithm::Ed25519)?;
     let config = russh::server::Config {
         auth_rejection_time: std::time::Duration::from_secs(3),
         auth_rejection_time_initial: Some(std::time::Duration::from_secs(0)),
@@ -128,7 +125,11 @@ impl russh::server::Handler for GitSession {
 
         session.channel_success(channel_id)?;
 
-        let channel = self.channels.lock().await.remove(&channel_id)
+        let channel = self
+            .channels
+            .lock()
+            .await
+            .remove(&channel_id)
             .ok_or_else(|| anyhow::anyhow!("channel gone"))?;
 
         let handle = session.handle();
@@ -230,9 +231,10 @@ async fn handle_receive_pack(
     let result = tokio::time::timeout(
         std::time::Duration::from_secs(5),
         stream.read_to_end(&mut request_data),
-    ).await;
+    )
+    .await;
     match result {
-        Ok(Ok(_)) => {}, // normal EOF
+        Ok(Ok(_)) => {} // normal EOF
         Ok(Err(e)) => return Err(e.into()),
         Err(_) => {
             // Timeout — client didn't close stdin (e.g., delete-only push).
@@ -268,7 +270,9 @@ async fn read_request<R: AsyncReadExt + Unpin>(reader: &mut R) -> Result<Vec<u8>
     let mut tmp = [0u8; 8192];
     loop {
         let n = reader.read(&mut tmp).await?;
-        if n == 0 { break; } // EOF
+        if n == 0 {
+            break;
+        } // EOF
         buf.extend_from_slice(&tmp[..n]);
         // Upload-pack ends with "done"
         let s = String::from_utf8_lossy(&buf);
@@ -280,7 +284,10 @@ async fn read_request<R: AsyncReadExt + Unpin>(reader: &mut R) -> Result<Vec<u8>
             break;
         }
         // Receive-pack delete-only: no want, no PACK, ends with terminal flush
-        if !s.contains("want ") && !buf.windows(4).any(|w| w == b"PACK") && ends_with_terminal_flush(&buf) {
+        if !s.contains("want ")
+            && !buf.windows(4).any(|w| w == b"PACK")
+            && ends_with_terminal_flush(&buf)
+        {
             break;
         }
     }
@@ -292,14 +299,24 @@ fn ends_with_terminal_flush(buf: &[u8]) -> bool {
     let mut pos = 0;
     while pos < buf.len() {
         if buf[pos..].starts_with(b"0000") {
-            if pos + 4 == buf.len() { return true; }
+            if pos + 4 == buf.len() {
+                return true;
+            }
             pos += 4;
             continue;
         }
-        if pos + 4 > buf.len() { break; }
-        let Ok(len_str) = std::str::from_utf8(&buf[pos..pos + 4]) else { break };
-        let Ok(len) = usize::from_str_radix(len_str, 16) else { break };
-        if len < 4 || pos + len > buf.len() { break; }
+        if pos + 4 > buf.len() {
+            break;
+        }
+        let Ok(len_str) = std::str::from_utf8(&buf[pos..pos + 4]) else {
+            break;
+        };
+        let Ok(len) = usize::from_str_radix(len_str, 16) else {
+            break;
+        };
+        if len < 4 || pos + len > buf.len() {
+            break;
+        }
         pos += len;
     }
     false

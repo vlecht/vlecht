@@ -1,4 +1,4 @@
-use crate::auth::{Did, assert_push_auth};
+use crate::auth::{assert_push_auth, Did};
 use crate::AppState;
 use axum::{
     body::Body,
@@ -103,10 +103,7 @@ pub async fn upload_pack(
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     Ok(Response::builder()
-        .header(
-            header::CONTENT_TYPE,
-            "application/x-git-upload-pack-result",
-        )
+        .header(header::CONTENT_TYPE, "application/x-git-upload-pack-result")
         .header(header::CACHE_CONTROL, "no-cache")
         .body(Body::from(data))
         .unwrap())
@@ -159,9 +156,7 @@ pub async fn log(
     let git_repo = open_repo(&state, &owner, &repo).await?;
 
     let ref_name = if refname.is_empty() {
-        git_repo
-            .default_branch()
-            .unwrap_or_else(|_| "HEAD".into())
+        git_repo.default_branch().unwrap_or_else(|_| "HEAD".into())
     } else {
         refname
     };
@@ -195,9 +190,7 @@ async fn tree_inner(
 ) -> Result<Response, StatusCode> {
     let git_repo = open_repo(state, owner, repo).await?;
 
-    let ref_name = git_repo
-        .default_branch()
-        .unwrap_or_else(|_| "HEAD".into());
+    let ref_name = git_repo.default_branch().unwrap_or_else(|_| "HEAD".into());
     let subpath = if tree_path.is_empty() {
         None
     } else {
@@ -217,9 +210,7 @@ pub async fn blob(
 ) -> Result<Response, StatusCode> {
     let git_repo = open_repo(&state, &owner, &repo).await?;
 
-    let ref_name = git_repo
-        .default_branch()
-        .unwrap_or_else(|_| "HEAD".into());
+    let ref_name = git_repo.default_branch().unwrap_or_else(|_| "HEAD".into());
     let data = git_repo
         .blob(&ref_name, &path)
         .map_err(|_| StatusCode::NOT_FOUND)?;
@@ -368,14 +359,16 @@ pub async fn create_repo(
     // Track in database: create an alias for it
     // Use a simple fake DID for MVP — in production this comes from auth
     let owner_did = format!("did:plc:{}", body.owner);
-    state.db.add_did(&owner_did).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    state.db.create_repo(
-        &owner_did,
-        None,
-        &owner_did,
-        &body.name,
-        "k256",
-    ).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    state
+        .db
+        .add_did(&owner_did)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    state
+        .db
+        .create_repo(&owner_did, None, &owner_did, &body.name, "k256")
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     tracing::info!("created repo {}/{}", body.owner, body.name);
 
@@ -400,8 +393,7 @@ pub async fn delete_repo(
         return Err(StatusCode::NOT_FOUND);
     }
 
-    std::fs::remove_dir_all(&repo_path)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    std::fs::remove_dir_all(&repo_path).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     // Remove from database
     let owner_did = format!("did:plc:{}", owner);

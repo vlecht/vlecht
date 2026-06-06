@@ -4,18 +4,20 @@
 
 ## What this is
 
-A Rust git hosting server (reimplementation of the Go-based Tangled knot server). Serves git over HTTP and SSH, plus a browse API. MVP scope: clone, pull, push, browse, create/delete repos.
+A Rust git hosting server (reimplementation of the Go-based Tangled knot server). Serves git over HTTP and SSH, plus a browse API and AT Protocol XRPC endpoints. Full drop-in replacement for the Go knotserver.
 
-**Stack:** tokio + axum + gix (pure Rust) + sqlx (SQLite) + clap + russh.
+**Stack:** tokio + axum + gix (pure Rust) + sqlx (SQLite) + clap + russh + jacquard (AT Protocol).
 
 ## Layout
 
-3-crate workspace rooted at `Cargo.toml`:
+4-crate workspace rooted at `Cargo.toml`:
 
 ```
-vlecht/        # binary + library. CLI, config, axum server, handlers, routing, SSH server
+vlecht/        # binary + library. CLI, config, axum server, handlers, routing, SSH, auth
 vlecht-git/    # pure gix git operations. No `git` binary anywhere.
 vlecht-db/     # sqlx-based data access. SQLite now, Postgres/MySQL later.
+vlecht-atp/    # AT Protocol integration: XRPC endpoints, identity, service auth, did:web
+gix-hash-patched/  # patched gix-hash with extra derives (workspace patch override)
 ```
 
 **`vlecht` is a lib+bin hybrid** (`src/lib.rs` + `src/main.rs`). The lib re-exports `build_app()` so integration tests can spawn the router in-process. Don't merge them.
@@ -32,36 +34,50 @@ If you need to do something git-shaped (delta resolution, ref updates, loose obj
 
 | File | What lives there |
 |------|------------------|
-| `vlecht-git/src/lib.rs` | All `GitRepo` methods. Read ops, `upload_pack_*`, `receive_pack_*`, thin-pack ingestion. Pack generation uses gix's `data::output::bytes::FromEntriesIter` — no hand-rolled encoder. |
-| `vlecht-git/src/error.rs` | `GitError` enum. Use `GitError::Protocol(msg)` for protocol-level issues. |
-| `vlecht/src/lib.rs` | `build_app()` — assembles the axum router. Add new routes here. |
+| `vlecht-git/src/lib.rs` | All `GitRepo` methods: read ops, pack generation, push/pull protocol, thin-pack ingestion, merge/fork ops. Pack generation uses gix's `data::output::bytes::FromEntriesIter` — no hand-rolled encoder. |
+| `vlecht-git/src/error.rs` | `GitError` enum. Use `GitError::Protocol(msg)` for protocol-level issues. Includes `From` impls for gix error types via `from_gix!` macro. |
+| `vlecht/src/lib.rs` | `build_app()` + `build_state()` — assembles the axum router with all routes and AT Protocol state. |
+| `vlecht/src/handlers.rs` | One async function per HTTP route. Handlers are thin: parse, call `GitRepo`, wrap response. Uses `open_repo()` helper to avoid repetitive `resolve_repo_path` + `GitRepo::open` boilerplate. |
+| `vlecht/src/auth.rs` | `AuthMode` (Proxy/Disabled), `require_auth` middleware, `assert_push_auth` for push ownership checks. |
+| `vlecht/src/config.rs` | `Config` struct + `from_env()`. Env vars: `KNOT_SERVER_LISTEN_ADDR`, `KNOT_SERVER_SSH_PORT`, `KNOT_SERVER_DB_PATH`, `KNOT_SERVER_HOSTNAME`, `KNOT_REPO_SCAN_PATH`, plus auth vars `VLECHT_AUTH_MODE` and `VLECHT_AUTH_DID_HEADER`. |
 | `vlecht/src/ssh.rs` | SSH server (`russh`). Spawns per-connection git protocol handlers with real exit-status. |
-| `vlecht/src/handlers.rs` | One async function per route. Handlers are thin: parse, call `GitRepo`, wrap response. Uses `open_repo()` helper to avoid repetitive `resolve_repo_path` + `GitRepo::open` boilerplate. |
 | `vlecht/src/main.rs` | CLI (`server` / `migrate` subcommands), tracing init, server bootstrap. |
-| `vlecht/src/config.rs` | `Config` struct + `from_env()`. Env vars: `KNOT_SERVER_LISTEN_ADDR`, `KNOT_SERVER_SSH_PORT`, `KNOT_SERVER_DB_PATH`, `KNOT_SERVER_HOSTNAME`, `KNOT_REPO_SCAN_PATH`. |
-| `vlecht-db/src/store.rs` | All SQL. Other crates never touch sqlx directly. |
+| `vlecht-db/src/store.rs` | All SQL via `RepoStore` trait. Other crates never touch sqlx directly. |
+| `vlecht-db/src/lib.rs` | `Db` type with `open()`, `migrate()`, `pool()`. |
 | `vlecht-db/src/repo.rs` | `Repo` data type. |
-| `vlecht/tests/e2e.rs` | End-to-end tests using real `git` CLI against a spawned server. |
+| `vlecht-atp/src/lib.rs` | Crate root — re-exports `config`, `error`, `identity`, `lex`, `service_auth` modules. |
+| `vlecht-atp/src/config.rs` | `AtpConfig` struct. Env vars: `VLECHT_ATP_AUDIENCE_DID`, `VLECHT_ATP_SERVICE_KEY_PATH`, `VLECHT_ATP_OWNER_DID`, `VLECHT_ATP_PLC_URL`, `VLECHT_ATP_DEV_DID`. |
+| `vlecht-atp/src/error.rs` | `XrpcError` enum — XRPC error envelope (`{"error": "<Tag>", "message": "..."}`) matching Go knotserver. `IntoResponse` impl maps variants to status codes. |
+| `vlecht-atp/src/identity.rs` | `AtpIdentity` — wraps `JacquardResolver` for DID/handle resolution. |
+| `vlecht-atp/src/service_auth.rs` | `build_service_auth_config()` — creates `ServiceAuthConfig` from `AtpConfig` + `AtpIdentity`. |
+| `vlecht-atp/src/lex/mod.rs` | XRPC sub-router: `LexState` (shared state), `router()` function. Defines all public + protected routes. |
+| `vlecht-atp/src/lex/*.rs` | One file per XRPC endpoint. Query endpoints use GET + `Query` params. Write endpoints use POST + JSON body + `MaybeAuth` extractor. |
+| `vlecht-atp/src/lex/maybe_auth.rs` | `MaybeAuth` extractor — resolves DID from `VerifiedServiceAuth` extensions (production) or `LexState.dev_did` (dev/test). |
+| `vlecht-atp/src/lex/resolve.rs` | `resolve_repo_path()` — shared helper for mapping repo param (DID or owner/rkey) to on-disk path. |
+| `vlecht/tests/e2e.rs` | End-to-end tests using real `git` CLI against a spawned HTTP+SSH server. |
 | `vlecht-git/tests/integration_test.rs` | Library-level tests for `vlecht-git`. |
+| `vlecht-atp/tests/xrpc.rs` | XRPC contract tests (47 total). Spawns server in-process, drives endpoints with reqwest. Uses `VLECHT_ATP_DEV_DID` for write endpoint auth bypass. |
 
 ## How to run
 
 ```bash
-# Build
-cargo build
-
 # Run the server
 KNOT_SERVER_DB_PATH=/tmp/vlecht.db KNOT_REPO_SCAN_PATH=/tmp/repos \
   cargo run -- server
 
-# Run all tests (58 total: 28 unit + 18 E2E + 4 vlecht-db + 8 vlecht-git)
+# Run with AT Protocol features (dev mode)
+KNOT_SERVER_DB_PATH=/tmp/vlecht.db KNOT_REPO_SCAN_PATH=/tmp/repos \
+  VLECHT_ATP_OWNER_DID=did:plc:myowner VLECHT_ATP_DEV_DID=did:plc:test \
+  cargo run -- server
+
+# Run all tests (47 vlecht-atp + 28 vlecht-git integration + 15 vlecht-git unit + E2E)
 cargo test
+
+# Run just XRPC tests (47 tests)
+cargo test -p vlecht-atp
 
 # Run just E2E (HTTP + SSH)
 cargo test -p vlecht --test e2e
-
-# Run just SSH E2E
-cargo test -p vlecht --test e2e ssh
 
 # Run just vlecht-git
 cargo test -p vlecht-git
@@ -153,28 +169,31 @@ Use `gix::refs::transaction::{RefEdit, Change, PreviousValue}`:
 - **SSH test hangs** → check that `exec_request` returns promptly and spawns the git work. If the session loop blocks, the client never receives the advertisement.
 - **Tests fail with "port already in use"** → check that `unique_port()` is being used and no hardcoded ports exist.
 
-## Next milestone: AT Protocol integration (Phase 4)
+## XRPC write endpoint auth
 
-The Go knotserver is an ATproto application. To be a drop-in replacement, vlecht needs ATproto identity, OAuth, and DID resolution. We use [`jacquard`](https://crates.io/crates/jacquard) (the Rust AT Protocol suite) for this:
+Write XRPC endpoints (`sh.tangled.repo.create`, `delete`, `setDefaultBranch`, `deleteBranch`, `merge`, `forkStatus`, `forkSync`, `hiddenRef`) are protected by service auth middleware when AT Protocol is configured.
 
-- `jacquard-identity` — DID resolution (`did:plc`, `did:web`)
-- `jacquard-oauth` — server-side DPoP token validation
-- `jacquard-repo` — CAR I/O, MST traversal, commit parsing
-- `jacquard-api` — generated XRPC bindings for `com.atproto.*`
-- `jacquard-axum` — axum extractors for auth
-- `jacquard-lexgen` — code generation for `tangled.git.*` lexicon types
+**Production:** `jacquard-axum::service_auth::service_auth_middleware` validates real AT Protocol tokens. The middleware inserts `VerifiedServiceAuth` into request extensions. Handlers use the `MaybeAuth` extractor to get the authenticated DID.
 
-See `PLAN.md` §5 Phase 4 for the checklist. This is **not** post-MVP — it's the next required phase for production parity.
+**Dev/test:** Set `VLECHT_ATP_DEV_DID=did:plc:yourdid` at server startup. The `dev_did` field is snapped into `LexState` at boot time (safe for concurrent tests — no process-global env contention). `MaybeAuth` falls back to this DID when no real token is present.
 
-## Post-MVP (don't do these now)
+When AT Protocol is not configured (no `VLECHT_ATP_AUDIENCE_DID`), the service auth middleware is not applied. The write endpoints are still mounted but return 401 unless `VLECHT_ATP_DEV_DID` is set.
 
-- Jetstream / firehose consumer enhancements
-- Casbin RBAC
-- SSE events
-- Fork operations
-- Merge checks
-- Pipeline/workflow triggers
-- Postgres/MySQL backend
-- Background pack maintenance sweeper
+## AT Protocol architecture
 
-See `PLAN.md` §9 for the full backlog.
+The XRPC router lives in `vlecht-atp/src/lex/mod.rs` and is mounted at `/xrpc` via `nest_service`. It has its own state (`LexState`) separate from the main app's `AppState`. The router merges:
+- **Public router:** GET endpoints (no middleware)
+- **Write router:** POST endpoints with optional service auth middleware
+
+`mergeCheck` is the only POST endpoint that's public (no auth) — matches Go knotserver behavior.
+
+## Git-level operations added for XRPC write endpoints
+
+`vlecht-git` gained these methods in Phases 4b-4c:
+- `set_default_branch(branch)` — update HEAD symref
+- `delete_branch(branch)` — delete a branch ref
+- `merge_base(a, b)` — find common ancestor
+- `is_ancestor(a, b)` — check ancestry relationship
+- `resolve_ref(name)` — resolve ref to OID
+- `fast_forward_ref(branch, target)` — fast-forward a branch
+- `set_hidden_ref(name, oid)` / `get_hidden_ref(name)` — hidden ref management

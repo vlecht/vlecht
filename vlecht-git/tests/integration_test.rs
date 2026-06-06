@@ -36,7 +36,12 @@ fn populate_bare(bare: &PathBuf, default_branch: &str) {
             .current_dir(&work)
             .output()
             .expect("git command failed");
-        assert!(out.status.success(), "git {:?} failed: {}", args, String::from_utf8_lossy(&out.stderr));
+        assert!(
+            out.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&out.stderr)
+        );
     };
 
     run(&["init", "-q", "-b", default_branch]);
@@ -58,7 +63,12 @@ fn populate_bare(bare: &PathBuf, default_branch: &str) {
 
     run(&["tag", "v1.0", "HEAD~1"]);
 
-    run(&["remote", "add", "origin", bare.as_os_str().to_str().unwrap()]);
+    run(&[
+        "remote",
+        "add",
+        "origin",
+        bare.as_os_str().to_str().unwrap(),
+    ]);
     run(&["push", "-q", "origin", default_branch]);
     run(&["push", "-q", "origin", "feature"]);
     run(&["push", "-q", "origin", "v1.0"]);
@@ -156,7 +166,12 @@ fn branches_lists_multiple() {
     populate_bare(&bare, "main");
 
     let repo = GitRepo::open(&bare).unwrap();
-    let names: Vec<String> = repo.branches().unwrap().into_iter().map(|b| b.name).collect();
+    let names: Vec<String> = repo
+        .branches()
+        .unwrap()
+        .into_iter()
+        .map(|b| b.name)
+        .collect();
     assert_eq!(names, vec!["feature", "main"]);
 
     cleanup(&dir);

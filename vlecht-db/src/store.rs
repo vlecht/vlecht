@@ -14,7 +14,11 @@ pub trait RepoStore {
     async fn find_repo_alias(&self, owner_did: &str, rkey: &str) -> Result<RepoAlias, DbError>;
 
     /// Get the repo DID for an owner/name pair (direct repo_keys lookup).
-    async fn get_repo_did_by_name(&self, owner_did: &str, repo_name: &str) -> Result<String, DbError>;
+    async fn get_repo_did_by_name(
+        &self,
+        owner_did: &str,
+        repo_name: &str,
+    ) -> Result<String, DbError>;
 
     /// Get owner DID + rkey for a repo DID, newest alias first.
     /// Matches Go `GetRepoKeyOwner`.
@@ -42,6 +46,15 @@ pub trait RepoStore {
 
     /// Get all public keys for a DID.
     async fn get_public_keys(&self, did: &str) -> Result<Vec<PublicKey>, DbError>;
+
+    /// Paginated list of all public keys, ordered by id ascending.
+    /// Returns up to `limit` rows whose `id` is strictly greater than `cursor`.
+    /// `cursor == ""` starts at the beginning.
+    async fn get_public_keys_paginated(
+        &self,
+        limit: i64,
+        cursor: &str,
+    ) -> Result<Vec<PublicKey>, DbError>;
 
     /// Get all public keys.
     async fn get_all_public_keys(&self) -> Result<Vec<PublicKey>, DbError>;
@@ -91,14 +104,17 @@ impl RepoStore for Db {
         }
     }
 
-    async fn get_repo_did_by_name(&self, owner_did: &str, repo_name: &str) -> Result<String, DbError> {
-        let row = sqlx::query(
-            "SELECT repo_did FROM repo_keys WHERE owner_did = ? AND repo_name = ?",
-        )
-        .bind(owner_did)
-        .bind(repo_name)
-        .fetch_optional(self.pool())
-        .await?;
+    async fn get_repo_did_by_name(
+        &self,
+        owner_did: &str,
+        repo_name: &str,
+    ) -> Result<String, DbError> {
+        let row =
+            sqlx::query("SELECT repo_did FROM repo_keys WHERE owner_did = ? AND repo_name = ?")
+                .bind(owner_did)
+                .bind(repo_name)
+                .fetch_optional(self.pool())
+                .await?;
 
         match row {
             Some(r) => Ok(r.try_get("repo_did")?),
@@ -217,10 +233,26 @@ impl RepoStore for Db {
     }
 
     async fn get_public_keys(&self, did: &str) -> Result<Vec<PublicKey>, DbError> {
+        let rows = sqlx::query("SELECT id, did, key, created FROM public_keys WHERE did = ?")
+            .bind(did)
+            .fetch_all(self.pool())
+            .await?;
+
+        rows.iter().map(row_to_public_key).collect()
+    }
+
+    async fn get_public_keys_paginated(
+        &self,
+        limit: i64,
+        cursor: &str,
+    ) -> Result<Vec<PublicKey>, DbError> {
+        // cursor is the row id; rows with id > cursor come next.
+        let cursor_id: i64 = cursor.parse().unwrap_or(0);
         let rows = sqlx::query(
-            "SELECT id, did, key, created FROM public_keys WHERE did = ?",
+            "SELECT id, did, key, created FROM public_keys WHERE id > ? ORDER BY id ASC LIMIT ?",
         )
-        .bind(did)
+        .bind(cursor_id)
+        .bind(limit)
         .fetch_all(self.pool())
         .await?;
 
@@ -274,7 +306,10 @@ impl RepoStore for Db {
             .fetch_all(self.pool())
             .await?;
 
-        Ok(rows.iter().map(|r| r.try_get("did").unwrap_or_default()).collect())
+        Ok(rows
+            .iter()
+            .map(|r| r.try_get("did").unwrap_or_default())
+            .collect())
     }
 }
 

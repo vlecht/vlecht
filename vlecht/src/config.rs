@@ -30,8 +30,8 @@ impl Config {
             Ok(val) if val == "proxy" => AuthMode::Proxy,
             _ => AuthMode::Disabled,
         };
-        let did_header = std::env::var("VLECHT_AUTH_DID_HEADER")
-            .unwrap_or_else(|_| "X-Vlecht-DID".into());
+        let did_header =
+            std::env::var("VLECHT_AUTH_DID_HEADER").unwrap_or_else(|_| "X-Vlecht-DID".into());
 
         Ok(Self {
             listen_addr: std::env::var("KNOT_SERVER_LISTEN_ADDR")
@@ -42,8 +42,7 @@ impl Config {
             repo_scan_path: std::env::var("KNOT_REPO_SCAN_PATH")
                 .unwrap_or_else(|_| "./repos".into())
                 .into(),
-            hostname: std::env::var("KNOT_SERVER_HOSTNAME")
-                .unwrap_or_else(|_| "localhost".into()),
+            hostname: std::env::var("KNOT_SERVER_HOSTNAME").unwrap_or_else(|_| "localhost".into()),
             ssh_port: std::env::var("KNOT_SERVER_SSH_PORT")
                 .ok()
                 .and_then(|s| s.parse().ok())
