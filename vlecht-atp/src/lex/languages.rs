@@ -11,12 +11,7 @@ use serde_json::{json, Value};
 ///
 /// Query params: `repo`, `ref` (default branch).
 ///
-/// Output: `{"ref", "languages": [{"name", "size", "percentage"}], "totalSize"?, "totalFiles"?}`
-///
-/// **Stub:** the Go knotserver uses `enry` for language detection. We don't
-/// pull that in yet; this returns an empty `languages` array. Adding real
-/// detection (extension-based fallback + `tokei`/`enry` bindings) is a
-/// follow-up.
+/// Output: `{"ref", "languages": [{"name", "size", "percentage"}], "totalSize", "totalFiles"}`
 #[derive(Deserialize)]
 pub struct Params {
     pub repo: String,
@@ -37,8 +32,22 @@ pub async fn handler(
         .or_else(|| repo.default_branch().ok())
         .ok_or_else(|| XrpcError::RefNotFound("default".into()))?;
 
+    // Collect file extensions and sizes by walking the tree.
+    let (stats, total_size, total_files) = repo
+        .language_stats(&ref_name)
+        .map_err(|e| XrpcError::InternalServerError(e.to_string()))?;
+
+    let languages: Vec<Value> = stats
+        .into_iter()
+        .map(|(name, size, pct)| {
+            json!({"name": name, "size": size, "percentage": pct})
+        })
+        .collect();
+
     Ok(Json(json!({
         "ref": ref_name,
-        "languages": [],
+        "languages": languages,
+        "totalSize": total_size,
+        "totalFiles": total_files,
     })))
 }

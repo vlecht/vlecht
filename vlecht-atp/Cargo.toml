@@ -13,6 +13,9 @@ thiserror.workspace = true
 anyhow = "1"
 base64 = "0.22"
 mime_guess = "2"
+sha2 = "0.10"
+hex = "0.4"
+urlencoding = "2"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 
 jacquard-axum = "0.11"
@@ -25,4 +28,8 @@ vlecht-git = { path = "../vlecht-git" }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 tempfile = "3"
 base64 = "0.22"
+bytes = "1"
+k256 = { version = "0.13", default-features = false, features = ["ecdsa", "std"] }
+multibase = "0.9"
+rand = "0.10"
 vlecht = { path = "../vlecht" }

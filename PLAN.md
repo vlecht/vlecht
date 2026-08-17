@@ -186,7 +186,7 @@ impl GitRepo {
 - `VLECHT_ATP_OWNER_DID` — surfaced by `sh.tangled.owner`; 500 if unset
 - `VLECHT_ATP_PLC_URL` — PLC directory URL (default `https://plc.directory`)
 
-**Auth (MVP):** `AuthMode::Proxy` — when `VLECHT_AUTH_MODE=proxy` is set, write routes (`git-receive-pack`, `POST /api/repos`, `DELETE /api/repos/*`) go through `auth::require_auth` middleware which reads a DID from `VLECHT_AUTH_DID_HEADER` (default `X-Vlecht-DID`). Push auth checks the DID owns the target repo. Read operations are always public. Disabled by default (`AuthMode::Disabled`).
+**Auth:** There is no disabled mode. Write routes (`git-receive-pack`, `POST /api/repos`, `DELETE /api/repos/*`) always go through `auth::require_auth` middleware, which reads a DID from `VLECHT_AUTH_DID_HEADER` (default `X-Vlecht-DID`) and rejects requests (401) when the header is missing or empty. Push auth checks the DID owns the target repo; repos with no DB alias are denied. Read operations are always public. SSH pushes authenticate via registered public keys (resolved to a DID through the `public_keys` table) and apply the same ownership check — password auth is disabled.
 
 ---
 
@@ -250,7 +250,7 @@ The Go server exposes two categories of routes:
 
 **What's NOT needed for drop-in (audited from Go source):**
 
-- **Casbin RBAC** — The Go server uses Casbin for multi-user permissions, collaborators, etc. Vlecht uses a simpler owner-DID model via `VLECHT_ATP_OWNER_DID` and `AuthMode::Proxy`. For single-owner repos (the MVP target), this is sufficient.
+- **Casbin RBAC** — The Go server uses Casbin for multi-user permissions, collaborators, etc. Vlecht uses a simpler owner-DID model via `VLECHT_ATP_OWNER_DID` and the always-on DID-header auth. For single-owner repos (the MVP target), this is sufficient.
 - **Internal Guard API** (`/guard`, `/push-allowed`, `/hooks/post-receive`) — Internal HTTP API for SSH-level auth and post-receive pipeline triggers. Vlecht's SSH server handles auth natively in `russh`.
 - **Jetstream consumer** — Subscribes to `#commit` events for auto-discovering new repos and key rotation. Not needed for serving git traffic.
 - **SSE /events endpoint** — Real-time event stream for the appview UI. Not needed for serving git traffic.
@@ -278,14 +278,14 @@ The Go server exposes two categories of routes:
 
 **4b — Service auth + core write endpoints ✅ DONE**
 
-- [x] Wire `jacquard-axum::service_auth::service_auth_middleware` to validate AT Protocol service auth tokens (replaces `AuthMode::Proxy` header hack with real DID resolution).
+- [x] Wire `jacquard-axum::service_auth::service_auth_middleware` to validate AT Protocol service auth tokens (supplements the always-on DID-header auth with real DID resolution for XRPC writes).
 - [x] Create protected XRPC router with service auth middleware applied.
 - [x] Implement `sh.tangled.repo.create` — create a bare repo (init, DB alias + repo_key, basic validation).
 - [x] Implement `sh.tangled.repo.delete` — delete repo (disk + DB).
 - [x] Implement `sh.tangled.repo.setDefaultBranch` — HEAD symref update.
 - [x] Implement `sh.tangled.repo.deleteBranch` — delete a ref with auth check.
 - [x] Tests for each write endpoint (9 tests: create, create-duplicate, create-invalid-name, delete, delete-not-found, setDefaultBranch, deleteBranch, deleteBranch-default-rejected, unauthorized).
-- [x] `MaybeAuth` extractor: resolves DID from `VerifiedServiceAuth` extensions (production) or `LexState.dev_did` (dev/test bypass via `VLECHT_ATP_DEV_DID`).
+- [x] `MaybeAuth` extractor: resolves DID from `VerifiedServiceAuth` extensions only. No bypass mode — tests mint real ES256K JWTs.
 - [x] `vlecht-git`: added `set_default_branch()` and `delete_branch()` methods.
 
 **4c — Remaining write endpoints + nice-to-haves ✅ DONE**
@@ -305,7 +305,7 @@ The Go server exposes two categories of routes:
 - [ ] Non-fast-forward merge support (tree-level merge via gix `merge_commits()`).
 - [ ] Full fork workflow (fetch from remote upstream).
 
-**Goal:** vlecht exposes all 8 write XRPC endpoints the Go knotserver protects behind `ServiceAuth.VerifyServiceAuth`. In production, `jacquard-axum::service_auth_middleware` validates real AT Protocol tokens. In dev/test, `VLECHT_ATP_DEV_DID` bypasses auth. Total: **47 integration tests, 0 failures**.
+**Goal:** vlecht exposes all 8 write XRPC endpoints the Go knotserver protects behind `ServiceAuth.VerifyServiceAuth`. `jacquard-axum::service_auth_middleware` validates real AT Protocol tokens. Tests mint real ES256K JWTs via a mock resolver — no bypass mode. Total: **48 integration tests, 0 failures**.
 
 ---
 

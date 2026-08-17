@@ -1,11 +1,12 @@
 //! Service auth extraction for write XRPC endpoints.
 //!
-//! `MaybeAuth` resolves the authenticated DID from:
-//! 1. `VerifiedServiceAuth` in request extensions (set by `service_auth_middleware`)
-//! 2. `LexState.dev_did` (dev/test bypass, set at startup from `VLECHT_ATP_DEV_DID`)
+//! `MaybeAuth` resolves the authenticated DID from the `VerifiedServiceAuth`
+//! extension, which is inserted by `service_auth_middleware` when a valid
+//! AT Protocol service auth token is presented.
 //!
-//! The env var is read once at server start and stored in state, avoiding
-//! process-global env contention in concurrent tests.
+//! There is no bypass mode. If the middleware is not configured (no
+//! `ServiceAuthConfig` passed to `router()`), or the token is missing/invalid,
+//! the extractor returns 401.
 
 use crate::lex::LexState;
 use axum::extract::FromRequestParts;
@@ -24,18 +25,10 @@ impl FromRequestParts<LexState> for MaybeAuth {
 
     async fn from_request_parts(
         parts: &mut Parts,
-        state: &LexState,
+        _state: &LexState,
     ) -> Result<Self, Self::Rejection> {
-        // 1. Real auth: extract from request extensions (set by middleware)
         if let Some(auth) = parts.extensions.get::<VerifiedServiceAuth<'static>>() {
             return Ok(MaybeAuth(auth.did().to_string()));
-        }
-
-        // 2. Dev/test bypass from LexState (set at startup from VLECHT_ATP_DEV_DID)
-        if let Some(ref did) = state.dev_did {
-            if !did.is_empty() {
-                return Ok(MaybeAuth(did.clone()));
-            }
         }
 
         Err((

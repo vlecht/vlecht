@@ -1,28 +1,13 @@
 // Service auth — the XRPC middleware that PDSes/clients use to authenticate
 // when calling protected endpoints.
 //
-// **Not wired in this session.** The read-side XRPC endpoints exposed by
-// `vlecht-atp/src/lex/` are public, matching the Go knotserver's behavior
-// for `sh.tangled.knot.*` and the read-side `sh.tangled.repo.*` queries.
+// Wired in `vlecht-atp/src/lex/mod.rs::router()`: when `AtpConfig::is_enabled()`
+// is true (audience DID + service key configured), the write XRPC router gets
+// `service_auth_middleware` applied, validating real AT Protocol service auth
+// tokens and inserting `VerifiedServiceAuth` into request extensions. The
+// `MaybeAuth` extractor (see `lex/maybe_auth.rs`) reads the DID from there.
 //
-// The write-side endpoints (create/delete repo, setDefaultBranch, etc.) will
-// need service auth. When we add them, the wiring pattern is:
-//
-// ```ignore
-// use jacquard_axum::service_auth::{ServiceAuthConfig, service_auth_middleware};
-//
-// let sa_cfg = ServiceAuthConfig::new(audience_did, resolver);
-// let write_router = Router::new()
-//     .route("/sh.tangled.repo.create", post(create::handler))
-//     .layer(middleware::from_fn_with_state(
-//         sa_cfg,
-//         service_auth_middleware::<ServiceAuthConfig<_>>,
-//     ))
-//     .with_state(sa_cfg);
-// ```
-//
-// We leave the import surface and config types here so the write endpoints
-// have somewhere obvious to plug in.
+// There is no bypass mode. Write endpoints require a valid signed JWT.
 
 use crate::config::AtpConfig;
 use crate::identity::AtpIdentity;

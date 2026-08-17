@@ -36,9 +36,11 @@ from_gix!(
     gix::open::Error,
     gix::init::Error,
     gix::reference::iter::Error,
+    gix::reference::iter::init::Error,
     gix::reference::find::existing::Error,
     gix::reference::find::Error,
     gix::reference::edit::Error,
+    gix::reference::peel::Error,
     gix::validate::reference::name::Error,
     gix::object::try_into::Error,
     gix::object::commit::Error,
@@ -50,3 +52,16 @@ from_gix!(
     gix::revision::spec::parse::single::Error,
     gix::revision::walk::iter::Error,
 );
+
+/// Catch-all for boxed std errors returned by some gix iterators.
+impl From<Box<dyn std::error::Error + Send + Sync>> for GitError {
+    fn from(e: Box<dyn std::error::Error + Send + Sync>) -> Self {
+        GitError::Gix(e.to_string())
+    }
+}
+
+impl From<gix::error::ValidationError> for GitError {
+    fn from(e: gix::error::ValidationError) -> Self {
+        GitError::Gix(e.to_string())
+    }
+}

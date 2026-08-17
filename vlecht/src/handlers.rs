@@ -3,12 +3,15 @@ use crate::AppState;
 use axum::{
     body::Body,
     extract::{Extension, Path, Query, State},
-    http::{header, StatusCode},
+    http::{self, header, StatusCode},
     response::{IntoResponse, Response},
 };
+use flate2::bufread::GzDecoder;
 use vlecht_db::RepoStore;
+use vlecht_git::paths::{is_safe_segment, join_safe, resolve_within_root};
 use vlecht_git::{ArchiveFormat, GitRepo};
 use serde::Deserialize;
+use std::io::Read;
 use std::sync::Arc;
 
 // ---------------------------------------------------------------------------
@@ -20,16 +23,27 @@ async fn resolve_repo_path(
     owner: &str,
     repo: &str,
 ) -> Result<std::path::PathBuf, StatusCode> {
+    // Reject path-traversal segments before joining anything.
+    if !is_safe_segment(owner) || !is_safe_segment(repo) {
+        return Err(StatusCode::NOT_FOUND);
+    }
+    let root = &state.cfg.repo_scan_path;
     if let Ok(alias) = state.db.find_repo_alias(owner, repo).await {
-        let path = state.cfg.repo_scan_path.join(&alias.repo_did);
-        if GitRepo::open(&path).is_ok() {
-            return Ok(path);
+        if is_safe_segment(&alias.repo_did) {
+            let candidate = root.join(&alias.repo_did);
+            if let Some(canon) = resolve_within_root(root, &candidate) {
+                if GitRepo::open(&canon).is_ok() {
+                    return Ok(canon);
+                }
+            }
         }
     }
 
-    let legacy = state.cfg.repo_scan_path.join(owner).join(repo);
-    if GitRepo::open(&legacy).is_ok() {
-        return Ok(legacy);
+    let legacy = join_safe(root, &[owner, repo]).ok_or(StatusCode::NOT_FOUND)?;
+    if let Some(canon) = resolve_within_root(root, &legacy) {
+        if GitRepo::open(&canon).is_ok() {
+            return Ok(canon);
+        }
     }
 
     Err(StatusCode::NOT_FOUND)
@@ -46,6 +60,23 @@ async fn open_repo(state: &AppState, owner: &str, repo: &str) -> Result<GitRepo,
 
 pub async fn healthcheck() -> &'static str {
     "ok"
+}
+
+/// Decompress the request body if Content-Encoding is gzip.
+/// Returns the decompressed bytes, or the original bytes if not compressed.
+fn maybe_decompress(headers: &axum::http::HeaderMap, body: &axum::body::Bytes) -> Vec<u8> {
+    let is_gzip = headers
+        .get(header::CONTENT_ENCODING)
+        .map(|v| v.as_bytes() == b"gzip")
+        .unwrap_or(false);
+    if is_gzip {
+        let mut decoder = GzDecoder::new(body.as_ref());
+        let mut decompressed = Vec::new();
+        if decoder.read_to_end(&mut decompressed).is_ok() {
+            return decompressed;
+        }
+    }
+    body.to_vec()
 }
 
 // --- git smart HTTP ---
@@ -68,6 +99,11 @@ pub async fn info_refs(
                 .upload_pack_advertise()
                 .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
             Ok(Response::builder()
+                .header(header::CONNECTION, "Keep-Alive")
+                .header(
+                    header::CACHE_CONTROL,
+                    "no-cache, max-age=0, must-revalidate",
+                )
                 .header(
                     header::CONTENT_TYPE,
                     "application/x-git-upload-pack-advertisement",
@@ -80,6 +116,11 @@ pub async fn info_refs(
                 .receive_pack_advertise()
                 .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
             Ok(Response::builder()
+                .header(header::CONNECTION, "Keep-Alive")
+                .header(
+                    header::CACHE_CONTROL,
+                    "no-cache, max-age=0, must-revalidate",
+                )
                 .header(
                     header::CONTENT_TYPE,
                     "application/x-git-receive-pack-advertisement",
@@ -94,12 +135,14 @@ pub async fn info_refs(
 pub async fn upload_pack(
     State(state): State<Arc<AppState>>,
     Path((owner, repo)): Path<(String, String)>,
+    headers: http::HeaderMap,
     body: axum::body::Bytes,
 ) -> Result<Response, StatusCode> {
     let git_repo = open_repo(&state, &owner, &repo).await?;
+    let decompressed = maybe_decompress(&headers, &body);
 
     let data = git_repo
-        .upload_pack_response(&body)
+        .upload_pack_response(&decompressed)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     Ok(Response::builder()
@@ -294,17 +337,17 @@ pub async fn archive(
 pub async fn receive_pack(
     State(state): State<Arc<AppState>>,
     Path((owner, repo)): Path<(String, String)>,
-    did: Option<Extension<Did>>,
+    Extension(did): Extension<Did>,
+    headers: http::HeaderMap,
     body: axum::body::Bytes,
 ) -> Result<Response, StatusCode> {
-    if let Some(Extension(Did(Some(did)))) = did {
-        assert_push_auth(&state, &owner, &repo, &did).await?;
-    }
+    assert_push_auth(&state, &owner, &repo, &did.0).await?;
 
     let git_repo = open_repo(&state, &owner, &repo).await?;
+    let decompressed = maybe_decompress(&headers, &body);
 
     let data = git_repo
-        .receive_pack(&body)
+        .receive_pack(&decompressed)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     Ok(Response::builder()
@@ -328,29 +371,29 @@ pub struct CreateRepoBody {
 
 pub async fn create_repo(
     State(state): State<Arc<AppState>>,
-    did: Option<Extension<Did>>,
+    Extension(did): Extension<Did>,
     axum::Json(body): axum::Json<CreateRepoBody>,
 ) -> Result<Response, StatusCode> {
-    if let Some(Extension(Did(Some(did)))) = did {
-        let expected = format!("did:plc:{}", body.owner);
-        if did != expected {
-            tracing::warn!(
-                "auth: create repo denied — {did} tried to create for owner {} (expected {})",
-                body.owner,
-                expected
-            );
-            return Err(StatusCode::FORBIDDEN);
-        }
+    let expected = format!("did:plc:{}", body.owner);
+    if did.0 != expected {
+        tracing::warn!(
+            "auth: create repo denied — {} tried to create for owner {} (expected {})",
+            did.0,
+            body.owner,
+            expected
+        );
+        return Err(StatusCode::FORBIDDEN);
     }
 
     let default_branch = body.default_branch.as_deref().unwrap_or("main");
-    let repo_path = state.cfg.repo_scan_path.join(&body.owner).join(&body.name);
+    let repo_path = join_safe(&state.cfg.repo_scan_path, &[&body.owner, &body.name])
+        .ok_or(StatusCode::BAD_REQUEST)?;
 
     if repo_path.exists() {
         return Err(StatusCode::CONFLICT);
     }
 
-    std::fs::create_dir_all(repo_path.parent().unwrap())
+    std::fs::create_dir_all(repo_path.parent().ok_or(StatusCode::BAD_REQUEST)?)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     GitRepo::init_bare(&repo_path, default_branch)
@@ -381,18 +424,15 @@ pub async fn create_repo(
 pub async fn delete_repo(
     State(state): State<Arc<AppState>>,
     Path((owner, repo)): Path<(String, String)>,
-    did: Option<Extension<Did>>,
+    Extension(did): Extension<Did>,
 ) -> Result<Response, StatusCode> {
-    if let Some(Extension(Did(Some(did)))) = did {
-        assert_push_auth(&state, &owner, &repo, &did).await?;
-    }
+    assert_push_auth(&state, &owner, &repo, &did.0).await?;
 
-    let repo_path = state.cfg.repo_scan_path.join(&owner).join(&repo);
+    let repo_path = join_safe(&state.cfg.repo_scan_path, &[&owner, &repo])
+        .and_then(|p| resolve_within_root(&state.cfg.repo_scan_path, &p))
+        .ok_or(StatusCode::NOT_FOUND)?;
 
-    if !repo_path.exists() {
-        return Err(StatusCode::NOT_FOUND);
-    }
-
+    // Remove via canonical path; resolve_within_root already confirmed containment.
     std::fs::remove_dir_all(&repo_path).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     // Remove from database

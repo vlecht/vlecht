@@ -9,3 +9,8 @@ pub mod error;
 pub mod identity;
 pub mod lex;
 pub mod service_auth;
+
+/// Re-exported so the `vlecht` binary crate can name the service-auth config
+/// type in `AppState` without a direct `jacquard-axum` dependency.
+pub use jacquard_axum::service_auth::ServiceAuthConfig;
+pub use jacquard_identity::JacquardResolver;

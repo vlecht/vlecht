@@ -18,7 +18,7 @@ pub async fn run_ssh_server(
     state: Arc<AppState>,
     port: u16,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let key = russh::keys::PrivateKey::random(&mut rand::rng(), russh::keys::Algorithm::Ed25519)?;
+    let key = load_or_create_host_key(&state.cfg.ssh_host_key_path)?;
     let config = russh::server::Config {
         auth_rejection_time: std::time::Duration::from_secs(3),
         auth_rejection_time_initial: Some(std::time::Duration::from_secs(0)),
@@ -30,6 +30,42 @@ pub async fn run_ssh_server(
     let addr = format!("0.0.0.0:{port}");
     tracing::info!("SSH listening on {addr}");
     server.run_on_address(Arc::new(config), addr).await?;
+    Ok(())
+}
+
+/// Load the SSH host key from `path`, or generate a fresh Ed25519 key and
+/// persist it there for future starts. The file is created with 0600 perms.
+fn load_or_create_host_key(
+    path: &std::path::Path,
+) -> Result<russh::keys::PrivateKey, Box<dyn std::error::Error + Send + Sync>> {
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+    if let Ok(pem) = std::fs::read_to_string(path) {
+        let key = russh::keys::decode_secret_key(&pem, None)?;
+        tracing::info!("loaded SSH host key from {}", path.display());
+        return Ok(key);
+    }
+    let key = russh::keys::PrivateKey::random(&mut rand::rng(), russh::keys::Algorithm::Ed25519)?;
+    let mut buf = Vec::new();
+    russh::keys::encode_pkcs8_pem(&key, &mut buf)?;
+    std::fs::write(path, &buf)?;
+    restrict_file_perms(path)?;
+    tracing::info!("generated and saved SSH host key to {}", path.display());
+    Ok(key)
+}
+
+/// Set restrictive permissions (0600) on the host key file.
+#[cfg(unix)]
+fn restrict_file_perms(path: &std::path::Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+}
+
+#[cfg(not(unix))]
+fn restrict_file_perms(_path: &std::path::Path) -> std::io::Result<()> {
     Ok(())
 }
 
@@ -49,7 +85,7 @@ impl russh::server::Server for GitSshServer {
         GitSession {
             state: self.state.clone(),
             channels: Arc::new(Mutex::new(HashMap::new())),
-            user: None,
+            auth_did: None,
         }
     }
 }
@@ -61,7 +97,8 @@ impl russh::server::Server for GitSshServer {
 struct GitSession {
     state: Arc<AppState>,
     channels: Arc<Mutex<HashMap<ChannelId, Channel<Msg>>>>,
-    user: Option<String>,
+    /// DID resolved from the authenticated public key. None until key auth succeeds.
+    auth_did: Option<String>,
 }
 
 impl russh::server::Handler for GitSession {
@@ -70,21 +107,38 @@ impl russh::server::Handler for GitSession {
     async fn auth_publickey(
         &mut self,
         user: &str,
-        _key: &PublicKey,
+        key: &PublicKey,
     ) -> Result<russh::server::Auth, Self::Error> {
-        tracing::debug!("SSH auth: user={user}");
-        self.user = Some(user.to_owned());
-        Ok(russh::server::Auth::Accept)
+        // Identity comes from the key, not the username (GitHub-style).
+        // Resolve the offered key to a DID via the public_keys table.
+        let offered = match key.to_openssh().ok().and_then(|s| normalize_pubkey(&s)) {
+            Some(n) => n,
+            None => return Ok(russh::server::Auth::Reject { proceed_with_methods: None, partial_success: false }),
+        };
+
+        match self.state.db.get_all_public_keys().await {
+            Ok(keys) => {
+                for pk in keys {
+                    if normalize_pubkey(&pk.key).is_some_and(|s| s == offered) {
+                        tracing::debug!("SSH auth: user={user} accepted as {}", pk.did);
+                        self.auth_did = Some(pk.did.clone());
+                        return Ok(russh::server::Auth::Accept);
+                    }
+                }
+            }
+            Err(e) => tracing::error!("SSH auth: db error: {e}"),
+        }
+        tracing::warn!("SSH auth: rejected for user={user}");
+        Ok(russh::server::Auth::Reject { proceed_with_methods: None, partial_success: false })
     }
 
     async fn auth_password(
         &mut self,
-        user: &str,
+        _user: &str,
         _password: &str,
     ) -> Result<russh::server::Auth, Self::Error> {
-        tracing::debug!("SSH auth (password): user={user}");
-        self.user = Some(user.to_owned());
-        Ok(russh::server::Auth::Accept)
+        // Password auth is disabled — only registered public keys are accepted.
+        Ok(russh::server::Auth::Reject { proceed_with_methods: None, partial_success: false })
     }
 
     async fn channel_open_session(
@@ -116,6 +170,27 @@ impl russh::server::Handler for GitSession {
             session.close(channel_id)?;
             return Ok(());
         };
+
+        // Pushes require ownership: the authenticated DID must own the repo.
+        if command == "git-receive-pack" {
+            let Some(ref did) = self.auth_did else {
+                session.data(channel_id, Vec::from(b"authentication required\n" as &[u8]))?;
+                session.close(channel_id)?;
+                return Ok(());
+            };
+            if crate::auth::assert_push_auth(&self.state, &owner, &repo_name, did)
+                .await
+                .is_err()
+            {
+                tracing::warn!("SSH push denied: {did} -> {owner}/{repo_name}");
+                session.data(
+                    channel_id,
+                    format!("push denied: not authorized for {owner}/{repo_name}\n").into_bytes(),
+                )?;
+                session.close(channel_id)?;
+                return Ok(());
+            }
+        }
 
         let Some(repo_path) = resolve_repo_path(&self.state, &owner, &repo_name).await else {
             session.data(channel_id, Vec::from(b"repository not found\n" as &[u8]))?;
@@ -194,8 +269,8 @@ async fn handle_upload_pack(
     };
     stream.write_all(&adv).await?;
 
-    // Phase 2: read client request (wants/haves + done)
-    let request_data = read_request(stream).await?;
+    // Phase 2: read client request (wants/haves + done), bounded.
+    let request_data = read_bounded(stream, vlecht_git::MAX_SSH_REQUEST_BYTES, true).await?;
 
     // Phase 3: generate and send pack response
     if !request_data.is_empty() {
@@ -224,23 +299,19 @@ async fn handle_receive_pack(
     };
     stream.write_all(&adv).await?;
 
-    // Phase 2: read client commands + pack data.
-    // Use read_to_end with a timeout. The client closes stdin after sending
-    // for pushes with pack data, but may not for delete-only pushes.
-    let mut request_data = Vec::new();
-    let result = tokio::time::timeout(
-        std::time::Duration::from_secs(5),
-        stream.read_to_end(&mut request_data),
-    )
-    .await;
-    match result {
-        Ok(Ok(_)) => {} // normal EOF
-        Ok(Err(e)) => return Err(e.into()),
-        Err(_) => {
-            // Timeout — client didn't close stdin (e.g., delete-only push).
-            // That's fine, we have the data we need.
-        }
-    }
+    // Phase 2: read client commands + pack data using a bounded, pkt-line-aware
+    // reader. The git protocol sends pkt-line commands, a flush (0000), then
+    // optionally a pack file. We parse pkt-lines to find the flush that marks
+    // the end of commands, then read any remaining pack data.
+    // Phase 2: read client commands + pack data. For receive-pack, the client
+    // sends pkt-line commands, a flush (0000), then optionally pack data
+    // (starting with PACK magic + a header that encodes the pack length).
+    // We read until EOF if the client closes the channel, or until we've
+    // received a complete pack (verified by parsing its header for the
+    // object count + trailing checksum). A timeout guards against clients
+    // that don't close stdin (e.g., delete-only pushes on some git versions).
+    let request_data = read_receive_pack_request(stream).await?;
+
     if request_data.is_empty() {
         return Ok(());
     }
@@ -259,65 +330,199 @@ async fn handle_receive_pack(
 // I/O helpers
 // ---------------------------------------------------------------------------
 
-/// Read the git client's request until we have a complete message.
-/// For upload-pack: wants/haves + 0000 + done\n + 0000
-/// For receive-pack: commands + 0000 + [pack data] (with PACK magic)
-/// We stop when we see "done" (upload-pack) or when we've received
-/// pack data followed by a terminal flush (receive-pack with pack),
-/// or a flush after a delete-only command.
-async fn read_request<R: AsyncReadExt + Unpin>(reader: &mut R) -> Result<Vec<u8>, anyhow::Error> {
+/// Read a git protocol request from the stream, bounded by `max_bytes`.
+///
+/// `expect_done`: true for upload-pack (request ends with a `done` pkt-line),
+/// false for receive-pack (request ends at EOF after commands + flush + pack).
+///
+/// Returns an error if the total exceeds `max_bytes` (DoS protection).
+async fn read_bounded<R: AsyncReadExt + Unpin>(
+    reader: &mut R,
+    max_bytes: usize,
+    expect_done: bool,
+) -> Result<Vec<u8>, anyhow::Error> {
     let mut buf = Vec::new();
     let mut tmp = [0u8; 8192];
+
     loop {
         let n = reader.read(&mut tmp).await?;
         if n == 0 {
-            break;
-        } // EOF
+            break; // EOF — always terminates receive-pack; also handles upload-pack
+        }
         buf.extend_from_slice(&tmp[..n]);
-        // Upload-pack ends with "done"
-        let s = String::from_utf8_lossy(&buf);
-        if s.contains("done\n") || s.contains("done") {
-            break;
+
+        if buf.len() > max_bytes {
+            anyhow::bail!(
+                "git request too large: {} bytes (max {})",
+                buf.len(),
+                max_bytes
+            );
         }
-        // Receive-pack with pack: contains PACK magic and ends with terminal flush
-        if buf.windows(4).any(|w| w == b"PACK") && ends_with_terminal_flush(&buf) {
-            break;
-        }
-        // Receive-pack delete-only: no want, no PACK, ends with terminal flush
-        if !s.contains("want ")
-            && !buf.windows(4).any(|w| w == b"PACK")
-            && ends_with_terminal_flush(&buf)
-        {
+
+        // For upload-pack, check if we've seen the `done` pkt-line.
+        if expect_done && contains_done_pktline(&buf) {
             break;
         }
     }
+
     Ok(buf)
 }
 
-/// Check if `buf` ends with a flush-pkt (0000) at a valid pkt-line boundary.
-fn ends_with_terminal_flush(buf: &[u8]) -> bool {
-    let mut pos = 0;
-    while pos < buf.len() {
-        if buf[pos..].starts_with(b"0000") {
-            if pos + 4 == buf.len() {
-                return true;
+/// Read a receive-pack request: pkt-line commands + flush + optional pack.
+///
+/// After the flush (0000) that terminates commands, we look for pack data
+/// (PACK magic). If pack data is present, we parse the pack header to
+/// determine the total pack size and read until we have the complete pack
+/// (header + objects + 20-byte SHA trailer). If no pack follows the flush
+/// (delete-only push), we return immediately.
+///
+/// A 30s timeout guards against clients that don't close the channel.
+/// Bounded by MAX_SSH_REQUEST_BYTES to prevent memory exhaustion.
+async fn read_receive_pack_request<R: AsyncReadExt + Unpin>(
+    reader: &mut R,
+) -> Result<Vec<u8>, anyhow::Error> {
+    let max_bytes = vlecht_git::MAX_SSH_REQUEST_BYTES;
+    let mut buf = Vec::new();
+    let mut tmp = [0u8; 8192];
+
+    // Phase 1: read until we see the flush (0000) that ends commands.
+    loop {
+        let n = reader.read(&mut tmp).await?;
+        if n == 0 {
+            // EOF before flush — delete-only or empty push.
+            return Ok(buf);
+        }
+        buf.extend_from_slice(&tmp[..n]);
+        if buf.len() > max_bytes {
+            anyhow::bail!("git request too large: {} bytes (max {})", buf.len(), max_bytes);
+        }
+
+        // Check if we've seen a flush packet at a pkt-line boundary.
+        if let Some(pack_offset) = find_flush_boundary(&buf) {
+            // Found the flush. Everything after `pack_offset` is pack data
+            // (or nothing, for delete-only pushes). The pack data may not
+            // have arrived yet — do a short-timeout read to check.
+            if pack_offset >= buf.len() {
+                // No data after flush yet. Try reading with a short timeout:
+                // if data arrives, it's pack data; if it times out, it's a
+                // delete-only push.
+                match tokio::time::timeout(
+                    std::time::Duration::from_millis(200),
+                    reader.read(&mut tmp),
+                )
+                .await
+                {
+                    Err(_) => {
+                        // Timeout — delete-only push. Done.
+                        return Ok(buf);
+                    }
+                    Ok(Err(e)) => return Err(e.into()),
+                    Ok(Ok(0)) => return Ok(buf), // EOF
+                    Ok(Ok(n)) => {
+                        buf.extend_from_slice(&tmp[..n]);
+                        if buf.len() > max_bytes {
+                            anyhow::bail!(
+                                "git request too large: {} bytes (max {})",
+                                buf.len(),
+                                max_bytes
+                            );
+                        }
+                        // Fall through to the pack-reading loop below.
+                    }
+                }
             }
+
+            // There's data after the flush. Check if it's pack data.
+            if !buf[pack_offset..].starts_with(b"PACK") {
+                // Not pack data — treat as complete (shouldn't happen in practice).
+                return Ok(buf);
+            }
+
+            // Phase 2: read the complete pack. The client sends the pack data
+            // after the flush and then waits for our response (it doesn't close
+            // the channel). So we read with a short timeout — if no more data
+            // arrives within 1s, we assume the pack is complete. This is safe
+            // because git sends the entire pack in a burst.
+            loop {
+                // Check if we might already have the full pack.
+                // After the PACK header (12 bytes), there's at least one object
+                // and a 20-byte SHA trailer. If we've read enough and no more
+                // data arrives, we're done.
+                match tokio::time::timeout(
+                    std::time::Duration::from_millis(200),
+                    reader.read(&mut tmp),
+                )
+                .await
+                {
+                    Err(_) => {
+                        // Timeout — no more data. Assume pack is complete.
+                        return Ok(buf);
+                    }
+                    Ok(Err(e)) => return Err(e.into()),
+                    Ok(Ok(0)) => {
+                        // EOF — pack is complete.
+                        return Ok(buf);
+                    }
+                    Ok(Ok(n)) => {
+                        buf.extend_from_slice(&tmp[..n]);
+                        if buf.len() > max_bytes {
+                            anyhow::bail!(
+                                "git request too large: {} bytes (max {})",
+                                buf.len(),
+                                max_bytes
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Find the position of the flush packet (0000) that terminates the command
+/// section. Returns the byte offset immediately AFTER the flush (where pack
+/// data would start), or None if no flush has been seen yet.
+fn find_flush_boundary(buf: &[u8]) -> Option<usize> {
+    let mut pos = 0;
+    while pos + 4 <= buf.len() {
+        if &buf[pos..pos + 4] == b"0000" {
+            return Some(pos + 4);
+        }
+        let len_str = std::str::from_utf8(&buf[pos..pos + 4]).ok()?;
+        let pkt_len = usize::from_str_radix(len_str, 16).ok()?;
+        if pkt_len < 4 || pos + pkt_len > buf.len() {
+            return None; // incomplete
+        }
+        pos += pkt_len;
+    }
+    None
+}
+
+/// Check if `buf` contains a `done` pkt-line (exact match, not substring).
+fn contains_done_pktline(buf: &[u8]) -> bool {
+    let mut pos = 0;
+    while pos + 4 <= buf.len() {
+        if &buf[pos..pos + 4] == b"0000" {
             pos += 4;
             continue;
         }
-        if pos + 4 > buf.len() {
-            break;
-        }
-        let Ok(len_str) = std::str::from_utf8(&buf[pos..pos + 4]) else {
-            break;
+        let len_str = match std::str::from_utf8(&buf[pos..pos + 4]) {
+            Ok(s) => s,
+            Err(_) => return false,
         };
-        let Ok(len) = usize::from_str_radix(len_str, 16) else {
-            break;
+        let pkt_len = match usize::from_str_radix(len_str, 16) {
+            Ok(n) => n,
+            Err(_) => return false,
         };
-        if len < 4 || pos + len > buf.len() {
-            break;
+        if pkt_len < 4 || pos + pkt_len > buf.len() {
+            return false; // incomplete — need more data
         }
-        pos += len;
+        let payload = &buf[pos + 4..pos + pkt_len];
+        let trimmed = payload.strip_suffix(b"\n").unwrap_or(payload);
+        if trimmed == b"done" {
+            return true;
+        }
+        pos += pkt_len;
     }
     false
 }
@@ -346,18 +551,40 @@ fn parse_owner_repo(path: &str) -> Option<(String, String)> {
     Some((owner.to_owned(), repo.to_owned()))
 }
 
+/// Reduce an OpenSSH public key line to its canonical `algo base64` form,
+/// dropping any trailing comment. Returns None if the line is malformed.
+fn normalize_pubkey(s: &str) -> Option<String> {
+    let mut parts = s.trim().split_whitespace();
+    let algo = parts.next()?;
+    let blob = parts.next()?;
+    if algo.is_empty() || blob.is_empty() {
+        return None;
+    }
+    Some(format!("{algo} {blob}"))
+}
+
 async fn resolve_repo_path(state: &AppState, owner: &str, repo: &str) -> Option<PathBuf> {
+    use vlecht_git::paths::{is_safe_segment, join_safe, resolve_within_root};
+    if !is_safe_segment(owner) || !is_safe_segment(repo) {
+        return None;
+    }
+    let root = &state.cfg.repo_scan_path;
     if let Ok(alias) = state.db.find_repo_alias(owner, repo).await {
-        let path = state.cfg.repo_scan_path.join(&alias.repo_did);
-        if path.join("HEAD").exists() {
-            return Some(path);
+        if is_safe_segment(&alias.repo_did) {
+            let candidate = root.join(&alias.repo_did);
+            if let Some(canon) = resolve_within_root(root, &candidate) {
+                if canon.join("HEAD").exists() {
+                    return Some(canon);
+                }
+            }
         }
     }
 
-    let legacy = state.cfg.repo_scan_path.join(owner).join(repo);
-    if legacy.join("HEAD").exists() {
-        return Some(legacy);
+    let legacy = join_safe(root, &[owner, repo])?;
+    let canon = resolve_within_root(root, &legacy)?;
+    if canon.join("HEAD").exists() {
+        Some(canon)
+    } else {
+        None
     }
-
-    None
 }

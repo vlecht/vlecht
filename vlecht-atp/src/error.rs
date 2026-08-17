@@ -25,10 +25,16 @@ pub enum XrpcError {
     RefNotFound(String),
     #[error("FileNotFound: {0}")]
     FileNotFound(String),
+    #[error("MergeConflict: {0}")]
+    MergeConflict(String),
+    #[error("RecordExists: {0}")]
+    RecordExists(String),
     #[error("InternalServerError: {0}")]
     InternalServerError(String),
     #[error("OwnerNotFound")]
     OwnerNotFound,
+    #[error("MissingActorDid")]
+    MissingActorDid,
     #[error("Unauthorized")]
     Unauthorized,
 }
@@ -44,8 +50,11 @@ impl XrpcError {
             Self::PathNotFound(_) => "PathNotFound",
             Self::RefNotFound(_) => "RefNotFound",
             Self::FileNotFound(_) => "FileNotFound",
+            Self::MergeConflict(_) => "MergeConflict",
+            Self::RecordExists(_) => "RecordExists",
             Self::InternalServerError(_) => "InternalServerError",
             Self::OwnerNotFound => "OwnerNotFound",
+            Self::MissingActorDid => "MissingActorDid",
             Self::Unauthorized => "Unauthorized",
         }
     }
@@ -68,14 +77,21 @@ impl IntoResponse for XrpcError {
                     "message": "owner not set for this service",
                 }),
             ),
-            Self::Unauthorized => (
+            Self::Unauthorized | Self::MissingActorDid => (
                 StatusCode::UNAUTHORIZED,
                 json!({
                     "error": self.tag(),
                     "message": "service authentication required",
                 }),
             ),
-            Self::RepoAlreadyExists(_) => (
+            Self::RepoAlreadyExists(_) | Self::RecordExists(_) => (
+                StatusCode::CONFLICT,
+                json!({
+                    "error": self.tag(),
+                    "message": self.to_string(),
+                }),
+            ),
+            Self::MergeConflict(_) => (
                 StatusCode::CONFLICT,
                 json!({
                     "error": self.tag(),

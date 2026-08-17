@@ -9,6 +9,7 @@
 use crate::error::XrpcError;
 use crate::lex::LexState;
 use vlecht_db::RepoStore;
+use vlecht_git::paths::{is_safe_segment, join_safe, resolve_within_root};
 use std::path::PathBuf;
 
 /// Resolve a `repo` parameter to a local bare-repo path.
@@ -26,14 +27,23 @@ pub async fn resolve_repo_path(state: &LexState, input: &str) -> Result<PathBuf,
     if !input.contains('/') {
         // Bare DID form: alias lookup, then on-disk under scan_path/<did>.
         if let Ok((owner_did, rkey)) = state.db.get_repo_key_owner(input).await {
-            let path = state.repo_scan_path.join(&owner_did).join(&rkey);
-            if path.exists() {
-                return Ok(path);
+            if is_safe_segment(&owner_did) && is_safe_segment(&rkey) {
+                if let Some(p) = join_safe(&state.repo_scan_path, &[&owner_did, &rkey]) {
+                    if let Some(canon) = resolve_within_root(&state.repo_scan_path, &p) {
+                        if canon.exists() {
+                            return Ok(canon);
+                        }
+                    }
+                }
             }
         }
-        let path = state.repo_scan_path.join(input);
-        if path.exists() {
-            return Ok(path);
+        if is_safe_segment(input) {
+            let p = state.repo_scan_path.join(input);
+            if let Some(canon) = resolve_within_root(&state.repo_scan_path, &p) {
+                if canon.exists() {
+                    return Ok(canon);
+                }
+            }
         }
         return Err(XrpcError::RepoNotFound(input.into()));
     }
@@ -41,15 +51,24 @@ pub async fn resolve_repo_path(state: &LexState, input: &str) -> Result<PathBuf,
     // owner/rkey form.
     let (owner_did, rkey) = input.split_once('/').unwrap();
 
-    if let Ok(repo_did) = state.db.get_repo_did_by_name(owner_did, rkey).await {
-        let path = state.repo_scan_path.join(&repo_did);
-        if path.exists() {
-            return Ok(path);
+    if is_safe_segment(owner_did) && is_safe_segment(rkey) {
+        if let Ok(repo_did) = state.db.get_repo_did_by_name(owner_did, rkey).await {
+            if is_safe_segment(&repo_did) {
+                let p = state.repo_scan_path.join(&repo_did);
+                if let Some(canon) = resolve_within_root(&state.repo_scan_path, &p) {
+                    if canon.exists() {
+                        return Ok(canon);
+                    }
+                }
+            }
         }
-    }
-    let path = state.repo_scan_path.join(owner_did).join(rkey);
-    if path.exists() {
-        return Ok(path);
+        if let Some(p) = join_safe(&state.repo_scan_path, &[owner_did, rkey]) {
+            if let Some(canon) = resolve_within_root(&state.repo_scan_path, &p) {
+                if canon.exists() {
+                    return Ok(canon);
+                }
+            }
+        }
     }
     Err(XrpcError::RepoNotFound(input.into()))
 }

@@ -38,25 +38,25 @@ If you need to do something git-shaped (delta resolution, ref updates, loose obj
 | `vlecht-git/src/error.rs` | `GitError` enum. Use `GitError::Protocol(msg)` for protocol-level issues. Includes `From` impls for gix error types via `from_gix!` macro. |
 | `vlecht/src/lib.rs` | `build_app()` + `build_state()` — assembles the axum router with all routes and AT Protocol state. |
 | `vlecht/src/handlers.rs` | One async function per HTTP route. Handlers are thin: parse, call `GitRepo`, wrap response. Uses `open_repo()` helper to avoid repetitive `resolve_repo_path` + `GitRepo::open` boilerplate. |
-| `vlecht/src/auth.rs` | `AuthMode` (Proxy/Disabled), `require_auth` middleware, `assert_push_auth` for push ownership checks. |
-| `vlecht/src/config.rs` | `Config` struct + `from_env()`. Env vars: `KNOT_SERVER_LISTEN_ADDR`, `KNOT_SERVER_SSH_PORT`, `KNOT_SERVER_DB_PATH`, `KNOT_SERVER_HOSTNAME`, `KNOT_REPO_SCAN_PATH`, plus auth vars `VLECHT_AUTH_MODE` and `VLECHT_AUTH_DID_HEADER`. |
-| `vlecht/src/ssh.rs` | SSH server (`russh`). Spawns per-connection git protocol handlers with real exit-status. |
+| `vlecht/src/auth.rs` | `Did` extension, `require_auth` middleware (always on — rejects requests without a valid DID header), `assert_push_auth` for push ownership checks. |
+| `vlecht/src/config.rs` | `Config` struct + `from_env()`. Env vars: `KNOT_SERVER_LISTEN_ADDR`, `KNOT_SERVER_SSH_PORT`, `KNOT_SERVER_DB_PATH`, `KNOT_SERVER_HOSTNAME`, `KNOT_REPO_SCAN_PATH`, `VLECHT_AUTH_DID_HEADER` (default `X-Vlecht-DID`), `VLECHT_SSH_HOST_KEY_PATH` (default `./vlecht-ssh-host-key`). |
+| `vlecht/src/ssh.rs` | SSH server (`russh`). Spawns per-connection git protocol handlers with real exit-status. Authenticates clients via registered public keys (resolved to a DID through the `public_keys` table); password auth is rejected. Pushes run `assert_push_auth` for ownership checks. Host key is persisted to disk (default `./vlecht-ssh-host-key`, override with `VLECHT_SSH_HOST_KEY_PATH`) and reused across restarts; generated on first start if absent. |
 | `vlecht/src/main.rs` | CLI (`server` / `migrate` subcommands), tracing init, server bootstrap. |
 | `vlecht-db/src/store.rs` | All SQL via `RepoStore` trait. Other crates never touch sqlx directly. |
 | `vlecht-db/src/lib.rs` | `Db` type with `open()`, `migrate()`, `pool()`. |
 | `vlecht-db/src/repo.rs` | `Repo` data type. |
 | `vlecht-atp/src/lib.rs` | Crate root — re-exports `config`, `error`, `identity`, `lex`, `service_auth` modules. |
-| `vlecht-atp/src/config.rs` | `AtpConfig` struct. Env vars: `VLECHT_ATP_AUDIENCE_DID`, `VLECHT_ATP_SERVICE_KEY_PATH`, `VLECHT_ATP_OWNER_DID`, `VLECHT_ATP_PLC_URL`, `VLECHT_ATP_DEV_DID`. |
+| `vlecht-atp/src/config.rs` | `AtpConfig` struct. Env vars: `VLECHT_ATP_AUDIENCE_DID`, `VLECHT_ATP_SERVICE_KEY_PATH`, `VLECHT_ATP_OWNER_DID`, `VLECHT_ATP_PLC_URL`. |
 | `vlecht-atp/src/error.rs` | `XrpcError` enum — XRPC error envelope (`{"error": "<Tag>", "message": "..."}`) matching Go knotserver. `IntoResponse` impl maps variants to status codes. |
 | `vlecht-atp/src/identity.rs` | `AtpIdentity` — wraps `JacquardResolver` for DID/handle resolution. |
 | `vlecht-atp/src/service_auth.rs` | `build_service_auth_config()` — creates `ServiceAuthConfig` from `AtpConfig` + `AtpIdentity`. |
-| `vlecht-atp/src/lex/mod.rs` | XRPC sub-router: `LexState` (shared state), `router()` function. Defines all public + protected routes. |
+| `vlecht-atp/src/lex/mod.rs` | XRPC sub-router: `LexState` (shared state), `router()` function (generic over `R: IdentityResolver`). Defines all public + protected routes. |
 | `vlecht-atp/src/lex/*.rs` | One file per XRPC endpoint. Query endpoints use GET + `Query` params. Write endpoints use POST + JSON body + `MaybeAuth` extractor. |
-| `vlecht-atp/src/lex/maybe_auth.rs` | `MaybeAuth` extractor — resolves DID from `VerifiedServiceAuth` extensions (production) or `LexState.dev_did` (dev/test). |
+| `vlecht-atp/src/lex/maybe_auth.rs` | `MaybeAuth` extractor — resolves DID from `VerifiedServiceAuth` extensions (set by service-auth middleware). No bypass mode. |
 | `vlecht-atp/src/lex/resolve.rs` | `resolve_repo_path()` — shared helper for mapping repo param (DID or owner/rkey) to on-disk path. |
 | `vlecht/tests/e2e.rs` | End-to-end tests using real `git` CLI against a spawned HTTP+SSH server. |
 | `vlecht-git/tests/integration_test.rs` | Library-level tests for `vlecht-git`. |
-| `vlecht-atp/tests/xrpc.rs` | XRPC contract tests (47 total). Spawns server in-process, drives endpoints with reqwest. Uses `VLECHT_ATP_DEV_DID` for write endpoint auth bypass. |
+| `vlecht-atp/tests/xrpc.rs` | XRPC contract tests (48 total). Spawns server in-process, drives endpoints with reqwest. Write tests mint real ES256K JWTs via a `MockResolver` — no env-var bypass. |
 
 ## How to run
 
@@ -65,15 +65,15 @@ If you need to do something git-shaped (delta resolution, ref updates, loose obj
 KNOT_SERVER_DB_PATH=/tmp/vlecht.db KNOT_REPO_SCAN_PATH=/tmp/repos \
   cargo run -- server
 
-# Run with AT Protocol features (dev mode)
+# Run with AT Protocol features
 KNOT_SERVER_DB_PATH=/tmp/vlecht.db KNOT_REPO_SCAN_PATH=/tmp/repos \
-  VLECHT_ATP_OWNER_DID=did:plc:myowner VLECHT_ATP_DEV_DID=did:plc:test \
+  VLECHT_ATP_OWNER_DID=did:plc:myowner VLECHT_ATP_AUDIENCE_DID=did:web:yourhost \
   cargo run -- server
 
-# Run all tests (47 vlecht-atp + 28 vlecht-git integration + 15 vlecht-git unit + E2E)
+# Run all tests (48 vlecht-atp + 28 vlecht-git integration + 15 vlecht-git unit + E2E)
 cargo test
 
-# Run just XRPC tests (47 tests)
+# Run just XRPC tests (48 tests)
 cargo test -p vlecht-atp
 
 # Run just E2E (HTTP + SSH)
@@ -173,11 +173,11 @@ Use `gix::refs::transaction::{RefEdit, Change, PreviousValue}`:
 
 Write XRPC endpoints (`sh.tangled.repo.create`, `delete`, `setDefaultBranch`, `deleteBranch`, `merge`, `forkStatus`, `forkSync`, `hiddenRef`) are protected by service auth middleware when AT Protocol is configured.
 
-**Production:** `jacquard-axum::service_auth::service_auth_middleware` validates real AT Protocol tokens. The middleware inserts `VerifiedServiceAuth` into request extensions. Handlers use the `MaybeAuth` extractor to get the authenticated DID.
+**Production:** `jacquard-axum::service_auth::service_auth_middleware` validates real AT Protocol tokens. The middleware inserts `VerifiedServiceAuth` into request extensions. Handlers use the `MaybeAuth` extractor to get the authenticated DID. There is no bypass mode.
 
-**Dev/test:** Set `VLECHT_ATP_DEV_DID=did:plc:yourdid` at server startup. The `dev_did` field is snapped into `LexState` at boot time (safe for concurrent tests — no process-global env contention). `MaybeAuth` falls back to this DID when no real token is present.
+**Tests:** `vlecht-atp/tests/xrpc.rs` uses a `MockResolver` implementing `IdentityResolver` (returns a DID document with a test k256 public key) and mints real ES256K JWTs signed with `k256::ecdsa::SigningKey`. No environment-variable bypass exists.
 
-When AT Protocol is not configured (no `VLECHT_ATP_AUDIENCE_DID`), the service auth middleware is not applied. The write endpoints are still mounted but return 401 unless `VLECHT_ATP_DEV_DID` is set.
+When AT Protocol is not configured (no `VLECHT_ATP_AUDIENCE_DID`), the service auth middleware is not applied. The write endpoints are still mounted but return 401.
 
 ## AT Protocol architecture
 

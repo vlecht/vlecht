@@ -1,4 +1,5 @@
 pub mod error;
+pub mod paths;
 
 use error::GitError;
 use flate2::{write::GzEncoder, Compression};
@@ -54,6 +55,13 @@ pub enum EntryKindSnapshot {
 pub enum ArchiveFormat {
     TarGz,
     Zip,
+}
+
+/// Info about a git submodule found in a tree.
+#[derive(Debug, Clone)]
+pub struct SubmoduleInfo {
+    pub name: String,
+    pub url: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -123,21 +131,19 @@ impl GitRepo {
     }
 
     pub fn branches(&self) -> Result<Vec<Branch>, GitError> {
-        let default = self.default_branch().ok();
+        let default = self.default_branch()?;
         let mut branches = Vec::new();
-        if let Ok(iter) = self.inner.references()?.local_branches() {
-            for r in iter.flatten() {
-                let name = r.name().shorten().to_string();
-                let target = r
-                    .into_fully_peeled_id()
-                    .map(|oid| oid.detach().to_string())
-                    .unwrap_or_default();
-                branches.push(Branch {
-                    is_default: default.as_deref() == Some(&name),
-                    name,
-                    target,
-                });
-            }
+        let platform = self.inner.references()?;
+        let iter = platform.local_branches()?;
+        for r in iter {
+            let r = r?;
+            let name = r.name().shorten().to_string();
+            let target = r.into_fully_peeled_id()?.detach().to_string();
+            branches.push(Branch {
+                is_default: default == name,
+                name,
+                target,
+            });
         }
         branches.sort_by(|a, b| a.name.cmp(&b.name));
         Ok(branches)
@@ -145,15 +151,13 @@ impl GitRepo {
 
     pub fn tags(&self) -> Result<Vec<Tag>, GitError> {
         let mut tags = Vec::new();
-        if let Ok(iter) = self.inner.references()?.tags() {
-            for r in iter.flatten() {
-                let name = r.name().shorten().to_string();
-                let target = r
-                    .into_fully_peeled_id()
-                    .map(|oid| oid.detach().to_string())
-                    .unwrap_or_default();
-                tags.push(Tag { name, target });
-            }
+        let platform = self.inner.references()?;
+        let iter = platform.tags()?;
+        for r in iter {
+            let r = r?;
+            let name = r.name().shorten().to_string();
+            let target = r.into_fully_peeled_id()?.detach().to_string();
+            tags.push(Tag { name, target });
         }
         tags.sort_by(|a, b| a.name.cmp(&b.name));
         Ok(tags)
@@ -171,24 +175,22 @@ impl GitRepo {
         let platform = self.inner.rev_walk([commit_id]);
         let walk = platform.all()?;
 
-        let commits: Vec<Commit> = walk
-            .flatten()
-            .filter_map(|info| {
-                let commit = info.object().ok()?;
-                let sig = commit.author().ok()?;
-                let time = sig.time().ok()?;
-                Some(Commit {
-                    sha: info.id.to_string(),
-                    message: commit.message().ok()?.summary().to_str_lossy().into_owned(),
-                    author: sig.name.to_string(),
-                    date: iso8601(&time),
-                })
-            })
-            .skip(offset)
-            .take(limit)
-            .collect();
+        let mut commits = Vec::new();
+        for info in walk {
+            let info = info?;
+            let commit = info.object()?;
+            let sig = commit.author()?;
+            let time = sig.time()?;
+            let message = commit.message()?.summary().to_str_lossy().into_owned();
+            commits.push(Commit {
+                sha: info.id.to_string(),
+                message,
+                author: sig.name.to_string(),
+                date: iso8601(&time),
+            });
+        }
 
-        Ok(commits)
+        Ok(commits.into_iter().skip(offset).take(limit).collect())
     }
 
     pub fn tree(
@@ -229,11 +231,7 @@ impl GitRepo {
             };
             let obj = entry.object()?;
             let size = if matches!(kind, EntryKindSnapshot::Blob) {
-                Some(
-                    obj.try_into_blob()
-                        .map(|b| b.data.len() as u64)
-                        .unwrap_or(0),
-                )
+                Some(obj.try_into_blob()?.data.len() as u64)
             } else {
                 None
             };
@@ -255,6 +253,45 @@ impl GitRepo {
         Ok(entries)
     }
 
+    /// Collect language statistics (name, size, percentage) by walking the tree
+    /// and classifying files by extension.
+    pub fn language_stats(
+        &self,
+        ref_name: &str,
+    ) -> Result<(Vec<(String, u64, f64)>, u64, u64), GitError> {
+        let spec = self.inner.rev_parse_single(ref_name)?;
+        let commit = spec.object()?.try_into_commit()?;
+        let tree = commit.tree()?;
+
+        let mut lang_sizes: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+        let mut total_size: u64 = 0;
+        let mut total_files: u64 = 0;
+
+        walk_tree(&self.inner, &tree, "", &mut |_path, data| {
+            total_files += 1;
+            total_size += data.len() as u64;
+            if let Some(lang) = detect_language(_path) {
+                *lang_sizes.entry(lang.to_string()).or_insert(0) += data.len() as u64;
+            }
+            Ok(())
+        })?;
+
+        let mut stats: Vec<(String, u64, f64)> = lang_sizes
+            .into_iter()
+            .map(|(name, size)| {
+                let pct = if total_size > 0 {
+                    (size as f64 / total_size as f64) * 100.0
+                } else {
+                    0.0
+                };
+                (name, size, pct)
+            })
+            .collect();
+        stats.sort_by(|a, b| b.1.cmp(&a.1));
+
+        Ok((stats, total_size, total_files))
+    }
+
     pub fn blob(&self, ref_name: &str, path: &str) -> Result<Vec<u8>, GitError> {
         let spec = self.inner.rev_parse_single(ref_name)?;
         let commit = spec.object()?.try_into_commit()?;
@@ -264,10 +301,137 @@ impl GitRepo {
         match entry {
             Some(e) => {
                 let blob = e.object()?.try_into_blob()?;
+                if blob.data.len() > MAX_BLOB_BYTES {
+                    return Err(GitError::Protocol(format!(
+                        "blob too large: {} bytes (max {})",
+                        blob.data.len(),
+                        MAX_BLOB_BYTES
+                    )));
+                }
                 Ok(blob.data.to_vec())
             }
             None => Err(GitError::Gix("blob not found".into())),
         }
+    }
+
+    /// Check if a tree entry at the given path is a git submodule (EntryKind::Commit).
+    /// Returns submodule info if found, None if the path is not a submodule.
+    pub fn submodule_entry(
+        &self,
+        ref_name: &str,
+        path: &str,
+    ) -> Result<Option<SubmoduleInfo>, GitError> {
+        let spec = self.inner.rev_parse_single(ref_name)?;
+        let commit = spec.object()?.try_into_commit()?;
+        let tree = commit.tree()?;
+        let components: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+        let entry = tree.lookup_entry(components)?;
+        match entry {
+            Some(e) if e.mode().kind() == EntryKind::Commit => {
+                // Try to read .gitmodules for the URL
+                let url = self.read_submodule_url(path)?;
+                Ok(Some(SubmoduleInfo {
+                    name: path.to_string(),
+                    url: url.unwrap_or_else(|| e.oid().to_string()),
+                }))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// Find the last commit that modified the given path.
+    /// Returns the commit SHA.
+    pub fn last_commit_for_path(&self, ref_name: &str, path: &str) -> Result<String, GitError> {
+        let spec = self.inner.rev_parse_single(ref_name)?;
+        let commit_id = spec.detach();
+        let platform = self.inner.rev_walk([commit_id]);
+        let mut walk = platform.all()?;
+
+        // Walk commits from the ref, find the first one that touched this path
+        for info in walk.by_ref().flatten() {
+            let commit = info.object()?;
+            let tree = commit.tree()?;
+
+            let components: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+            if tree.lookup_entry(components.clone()).is_ok() {
+                // Check if this path was different in the parent(s)
+                let parent_trees: Vec<_> = commit
+                    .parent_ids()
+                    .filter_map(|id| {
+                        id.object()
+                            .ok()
+                            .and_then(|obj| obj.try_into_commit().ok())
+                            .and_then(|c| c.tree().ok())
+                    })
+                    .collect();
+
+                let mut changed = parent_trees.is_empty();
+                if !changed {
+                    for pt in &parent_trees {
+                        if let Ok(old_entry) = pt.lookup_entry(components.clone()) {
+                            let current_tree_id = tree.id();
+                            let old_matches =
+                                old_entry.map_or(true, |oe| oe.oid() == current_tree_id.detach());
+                            if !old_matches {
+                                changed = true;
+                                break;
+                            }
+                        } else {
+                            changed = true;
+                            break;
+                        }
+                    }
+                }
+
+                if changed || parent_trees.is_empty() {
+                    return Ok(info.id.to_string());
+                }
+            }
+        }
+
+        Err(GitError::Gix(format!(
+            "no commit found for path {}",
+            path
+        )))
+    }
+
+    /// Read the submodule URL from .gitmodules for a given path.
+    fn read_submodule_url(&self, submodule_path: &str) -> Result<Option<String>, GitError> {
+        // Try to read .gitmodules from the HEAD commit tree
+        let head_commit = match self.inner.head_commit() {
+            Ok(commit) => commit,
+            Err(_) => return Ok(None),
+        };
+        let tree = match head_commit.tree() {
+            Ok(t) => t,
+            Err(_) => return Ok(None),
+        };
+
+        let modules_entry = tree.lookup_entry([".gitmodules"])?;
+        let Some(entry) = modules_entry else { return Ok(None) };
+        let blob = entry.object()?.try_into_blob()?;
+        let content = String::from_utf8_lossy(&blob.data);
+
+        // Simple INI-style parser for .gitmodules
+        let search = format!("[submodule \"{}\"]", submodule_path);
+        let mut found = false;
+        for line in content.lines() {
+            let trimmed = line.trim();
+            if trimmed == search.as_str() {
+                found = true;
+                continue;
+            }
+            if found {
+                if trimmed.starts_with('[') {
+                    break;
+                }
+                if let Some(url) = trimmed.strip_prefix("url = ") {
+                    return Ok(Some(url.trim().to_string()));
+                }
+            }
+        }
+
+        Ok(None)
     }
 
     pub fn diff(&self, base: Option<&str>, head: Option<&str>) -> Result<String, GitError> {
@@ -309,6 +473,15 @@ impl GitRepo {
         let spec = self.inner.rev_parse_single(ref_name)?;
         let commit = spec.object()?.try_into_commit()?;
         let tree = commit.tree()?;
+
+        // Pre-flight: estimate total content size to prevent OOM on large repos.
+        let estimated = estimate_tree_size(&self.inner, &tree);
+        if estimated > MAX_ARCHIVE_BYTES {
+            return Err(GitError::Protocol(format!(
+                "archive too large: estimated {} bytes (max {})",
+                estimated, MAX_ARCHIVE_BYTES
+            )));
+        }
 
         let mut buf = Vec::new();
         match format {
@@ -375,6 +548,8 @@ impl GitRepo {
     pub fn receive_pack(&self, request_body: &[u8]) -> Result<Vec<u8>, GitError> {
         let (commands, pack_data) = split_receive_pack(request_body)?;
 
+        let zero_oid = zero_oid_for_kind(self.inner.object_hash());
+
         // Ingest the pack if there is any
         if !pack_data.is_empty() {
             self.ingest_thin_pack(pack_data)?;
@@ -383,7 +558,22 @@ impl GitRepo {
         // Update refs based on commands
         let mut reports = Vec::new();
         for cmd in &commands {
-            let old_oid = if cmd.old_sha == ZERO_OID {
+            // Enforce ref-namespace policy: clients may only push to
+            // refs/heads/* and refs/tags/*. Other namespaces (refs/hidden/,
+            // refs/remotes/, etc.) are server-internal.
+            if !is_pushable_ref(&cmd.refname) {
+                tracing::warn!(
+                    "receive_pack: rejecting ref update to disallowed namespace: {}",
+                    cmd.refname
+                );
+                reports.push(format!(
+                    "ng {} ref namespace not allowed\n",
+                    cmd.refname
+                ));
+                continue;
+            }
+
+            let old_oid = if cmd.old_sha == zero_oid {
                 None
             } else {
                 Some(
@@ -391,7 +581,7 @@ impl GitRepo {
                         .map_err(|e| GitError::Protocol(format!("invalid old sha: {e}")))?,
                 )
             };
-            let new_oid = if cmd.new_sha == ZERO_OID {
+            let new_oid = if cmd.new_sha == zero_oid {
                 None
             } else {
                 Some(
@@ -450,7 +640,9 @@ impl GitRepo {
         use gix_object::Write;
 
         if pack_data.len() < 12 || &pack_data[..4] != b"PACK" {
-            return Ok(());
+            return Err(GitError::Protocol(
+                "invalid pack data: missing PACK header".into(),
+            ));
         }
 
         // Write pack+index to disk and also write each resolved object
@@ -458,7 +650,7 @@ impl GitRepo {
         // We do the Bundle write first (handles thin-pack delta resolution
         // fully), then re-parse to extract individual objects.
         let pack_dir = self.inner.git_dir().join("objects").join("pack");
-        std::fs::create_dir_all(&pack_dir).ok();
+        std::fs::create_dir_all(&pack_dir).map_err(|e| GitError::Io(e))?;
 
         // Parse with Bundle::write_to_directory which handles all delta resolution
         let mut reader = std::io::BufReader::new(pack_data);
@@ -601,7 +793,9 @@ impl GitRepo {
         Ok(())
     }
 
-    /// Delete a branch ref by name. Returns Ok even if the branch doesn't exist.
+    /// Delete a branch ref by name. Returns Ok if the branch was deleted
+    /// or didn't exist. Returns an error for genuine failures (lock issues,
+    /// I/O errors, invalid branch name).
     pub fn delete_branch(&self, branch: &str) -> Result<(), GitError> {
         use gix::refs::{Category, FullName};
         use gix::refs::transaction::{Change, PreviousValue, RefEdit};
@@ -618,9 +812,22 @@ impl GitRepo {
             deref: false,
         };
 
-        // gix returns an error if the ref doesn't exist; swallow it.
-        let _ = self.inner.edit_reference(edit);
-        Ok(())
+        // edit_reference returns an error if the ref doesn't exist, which is
+        // not a failure for a delete operation. We only surface real errors
+        // (lock contention, I/O, permission issues).
+        match self.inner.edit_reference(edit) {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                let msg = e.to_string();
+                // gix reports "reference ... not found" when deleting a
+                // nonexistent ref. That's not an error for delete_branch.
+                if msg.contains("not found") || msg.contains("does not exist") {
+                    Ok(())
+                } else {
+                    Err(GitError::Gix(msg))
+                }
+            }
+        }
     }
 
     /// Find the merge base between two refs. Returns `None` if no common ancestor.
@@ -713,8 +920,13 @@ impl GitRepo {
         let refname = format!("refs/hidden/{name}");
         match self.inner.try_find_reference(&refname)? {
             Some(r) => {
-                let oid = r.into_fully_peeled_id().map(|o| o.detach().to_string()).unwrap_or_default();
-                Ok(Some(oid))
+                // If the ref can't be peeled to an OID, treat it as missing
+                // rather than returning Some("") (which is indistinguishable
+                // from a valid empty target).
+                match r.into_fully_peeled_id() {
+                    Ok(oid) => Ok(Some(oid.detach().to_string())),
+                    Err(_) => Ok(None),
+                }
             }
             None => Ok(None),
         }
@@ -723,9 +935,48 @@ impl GitRepo {
 
 // --- Protocol helpers ---
 
-const ZERO_OID: &str = "0000000000000000000000000000000000000000";
+/// Zero OID for SHA-1 (the common case). Used for protocol-level comparisons
+/// where the hash kind is known to be SHA-1 (git protocol v1 default).
+/// For SHA-256 repos, the zero OID is 64 zeros — use `zero_oid_for_kind()`.
+const ZERO_OID_SHA1: &str = "0000000000000000000000000000000000000000";
 const CAPABILITIES: &str = "side-band-64k";
 const RECEIVE_CAPABILITIES: &str = "report-status report-status-v2 delete-refs side-band-64k";
+
+/// Return the zero OID string for the given object hash kind.
+/// Return the zero OID string for the given object hash kind.
+///
+/// For SHA-1 (the default), this is 40 zeros. If SHA-256 support is enabled
+/// in the future, add a `Kind::Sha256` arm returning 64 zeros.
+fn zero_oid_for_kind(kind: gix::hash::Kind) -> &'static str {
+    match kind {
+        gix::hash::Kind::Sha1 => ZERO_OID_SHA1,
+        // SHA-256 not currently enabled — if enabled, add:
+        // gix::hash::Kind::Sha256 => "0000...00" (64 zeros)
+        _ => ZERO_OID_SHA1,
+    }
+}
+
+/// Maximum total bytes we'll buffer for an SSH git request (commands + pack).
+/// 512 MB is generous for real pushes while preventing memory-exhaustion DoS.
+pub const MAX_SSH_REQUEST_BYTES: usize = 512 * 1024 * 1024;
+
+/// Maximum size of a blob served via the browse API (100 MB).
+/// Prevents memory exhaustion from large binary blobs.
+const MAX_BLOB_BYTES: usize = 100 * 1024 * 1024;
+
+/// Maximum size of an archive response (512 MB).
+/// Prevents memory exhaustion from large repos.
+const MAX_ARCHIVE_BYTES: usize = 512 * 1024 * 1024;
+
+/// Validate that a refname is in an allowed namespace for pushes.
+///
+/// Pushes may only create/update/delete refs under `refs/heads/` (branches)
+/// or `refs/tags/` (tags). Other namespaces (`refs/hidden/`, `refs/remotes/`,
+/// `refs/notes/`, etc.) are reserved for server-internal use and must not be
+/// writable by clients over the push protocol.
+fn is_pushable_ref(refname: &str) -> bool {
+    refname.starts_with("refs/heads/") || refname.starts_with("refs/tags/")
+}
 
 fn advertise_refs(
     repo: &GitRepo,
@@ -745,17 +996,18 @@ fn advertise_refs(
     }
 
     let platform = repo.inner.references()?;
-    if let Ok(iter) = platform.all() {
-        for mut r in iter.flatten() {
-            let name = r.name().as_bstr().to_string();
-            if let Ok(id) = r.peel_to_id() {
-                refs.push((id.to_string(), name));
-            }
-        }
+    let iter = platform.all()?;
+    for r in iter {
+        let mut r = r?;
+        let name = r.name().as_bstr().to_string();
+        let id = r.peel_to_id()?;
+        refs.push((id.to_string(), name));
     }
 
+    let zero_oid = zero_oid_for_kind(repo.inner.object_hash());
+
     if refs.is_empty() {
-        let line = format!("{} capabilities^{{}}\0{capabilities}\n", ZERO_OID);
+        let line = format!("{} capabilities^{{}}\0{capabilities}\n", zero_oid);
         output.extend_from_slice(&pkt_encode(line.as_bytes()));
     } else {
         let (oid, name) = &refs[0];
@@ -888,18 +1140,20 @@ impl UploadPackRequest {
                 continue;
             }
             let payload = &body[pos + 4..pos + len];
-            let line = std::str::from_utf8(payload).unwrap_or("");
+            let line = std::str::from_utf8(payload)
+                .map_err(|_| GitError::Protocol("non-utf8 pkt-line in upload-pack request".into()))?;
             let line = line.trim_end_matches('\n');
 
             if line == "done" {
                 break;
             } else if let Some(rest) = line.strip_prefix("want ") {
-                let hex = &rest[..40.min(rest.len())];
+                // OID is the first token; capabilities follow after a space.
+                let hex = rest.split_whitespace().next().unwrap_or("");
                 if let Ok(oid) = gix::ObjectId::from_hex(hex.as_bytes()) {
                     wants.push(oid);
                 }
             } else if let Some(rest) = line.strip_prefix("have ") {
-                let hex = &rest[..40.min(rest.len())];
+                let hex = rest.split_whitespace().next().unwrap_or("");
                 if let Ok(oid) = gix::ObjectId::from_hex(hex.as_bytes()) {
                     haves.push(oid);
                 }
@@ -1010,7 +1264,7 @@ fn send_sideband(buf: &mut Vec<u8>, data: &[u8]) {
     const MAX: usize = 65515;
     for chunk in data.chunks(MAX) {
         let pkt_len = 4 + 1 + chunk.len();
-        write!(buf, "{pkt_len:04x}").ok();
+        write!(buf, "{pkt_len:04x}").expect("writing to Vec cannot fail");
         buf.push(0x01);
         buf.extend_from_slice(chunk);
     }
@@ -1034,7 +1288,107 @@ fn iso8601(time: &gix::date::Time) -> String {
     )
 }
 
+// --- Language detection ---
+
+/// Detect a programming language from a file path's extension.
+/// Returns the language name, or None for unrecognized/vendored files.
+fn detect_language(path: &str) -> Option<&'static str> {
+    let ext = path.rsplit('.').next()?.to_ascii_lowercase();
+    Some(match ext.as_str() {
+        "rs" => "Rust",
+        "go" => "Go",
+        "py" => "Python",
+        "js" | "mjs" | "cjs" => "JavaScript",
+        "ts" | "tsx" => "TypeScript",
+        "jsx" => "JavaScript",
+        "java" => "Java",
+        "kt" | "kts" => "Kotlin",
+        "c" | "h" => "C",
+        "cpp" | "cc" | "cxx" | "hpp" | "hh" => "C++",
+        "cs" => "C#",
+        "rb" => "Ruby",
+        "php" => "PHP",
+        "swift" => "Swift",
+        "scala" => "Scala",
+        "clj" | "cljs" | "cljc" => "Clojure",
+        "hs" => "Haskell",
+        "lua" => "Lua",
+        "pl" => "Perl",
+        "sh" | "bash" => "Shell",
+        "zsh" => "Shell",
+        "fish" => "Shell",
+        "ps1" => "PowerShell",
+        "bat" | "cmd" => "Batch",
+        "html" | "htm" => "HTML",
+        "css" => "CSS",
+        "scss" | "sass" => "SCSS",
+        "less" => "Less",
+        "vue" => "Vue",
+        "svelte" => "Svelte",
+        "json" => "JSON",
+        "yaml" | "yml" => "YAML",
+        "toml" => "TOML",
+        "xml" => "XML",
+        "md" | "markdown" => "Markdown",
+        "rst" => "reStructuredText",
+        "tex" => "LaTeX",
+        "sql" => "SQL",
+        "dockerfile" => "Dockerfile",
+        "makefile" | "mk" => "Makefile",
+        "gradle" => "Gradle",
+        "dart" => "Dart",
+        "elm" => "Elm",
+        "ex" | "exs" => "Elixir",
+        "erl" => "Erlang",
+        "gleam" => "Gleam",
+        "zig" => "Zig",
+        "nim" => "Nim",
+        "v" => "V",
+        "ml" | "mli" => "OCaml",
+        "fs" | "fsx" => "F#",
+        "vala" => "Vala",
+        _ => return None,
+    })
+}
+
 // --- Archive ---
+
+/// Estimate the total uncompressed size of all blobs in a tree (recursively).
+/// Used as a pre-flight check to reject archives that would OOM the server.
+fn estimate_tree_size(repo: &gix::Repository, tree: &gix::Tree<'_>) -> usize {
+    let mut total = 0;
+    estimate_tree_size_inner(repo, tree, &mut total);
+    total
+}
+
+fn estimate_tree_size_inner(repo: &gix::Repository, tree: &gix::Tree<'_>, total: &mut usize) {
+    // Bail out early if we've already exceeded the cap — no point walking further.
+    if *total > MAX_ARCHIVE_BYTES {
+        return;
+    }
+    for entry in tree.iter().flatten() {
+        match entry.mode().kind() {
+            EntryKind::Blob | EntryKind::BlobExecutable | EntryKind::Link => {
+                if let Ok(obj) = entry.object() {
+                    if let Ok(blob) = obj.try_into_blob() {
+                        *total += blob.data.len();
+                        if *total > MAX_ARCHIVE_BYTES {
+                            return;
+                        }
+                    }
+                }
+            }
+            EntryKind::Tree => {
+                if let Ok(obj) = entry.object() {
+                    if let Ok(sub) = obj.try_into_tree() {
+                        estimate_tree_size_inner(repo, &sub, total);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
 
 /// Walk a git tree and call `emit` for each blob with `(path, data)`.
 /// Directories are recursed into automatically; `prefix` gets a trailing `/` appended.

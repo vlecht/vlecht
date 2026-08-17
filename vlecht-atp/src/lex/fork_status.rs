@@ -1,10 +1,10 @@
 use crate::error::XrpcError;
+use crate::lex::authz::assert_owns_by_name;
 use crate::lex::maybe_auth::MaybeAuth;
 use crate::lex::resolve::resolve_repo_path;
 use crate::lex::LexState;
 use axum::extract::State;
 use axum::Json;
-use vlecht_db::RepoStore;
 use vlecht_git::GitRepo;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -27,7 +27,7 @@ pub struct Input {
 
 pub async fn handler(
     State(state): State<LexState>,
-    _auth: MaybeAuth,
+    MaybeAuth(actor_did): MaybeAuth,
     Json(body): Json<Input>,
 ) -> Result<Json<Value>, XrpcError> {
     let repo_name = body.name.as_deref().unwrap_or_else(|| {
@@ -37,11 +37,8 @@ pub async fn handler(
             .unwrap_or("unknown")
     });
 
-    let repo_did = state
-        .db
-        .get_repo_did_by_name(&body.did, repo_name)
-        .await
-        .map_err(|_| XrpcError::RepoNotFound(format!("{}/{}", body.did, repo_name)))?;
+    let repo_did =
+        assert_owns_by_name(&state, &actor_did, &body.did, repo_name).await?;
 
     let repo_path = resolve_repo_path(&state, &repo_did).await?;
     let repo = GitRepo::open(&repo_path)

@@ -24,5 +24,28 @@ pub async fn handler(
     let branch = repo
         .default_branch()
         .map_err(|_| XrpcError::RefNotFound(p.repo.clone()))?;
-    Ok(Json(json!({ "branch": branch })))
+
+    // Try to get the tip commit info
+    let mut response = json!({
+        "name": branch,
+        "hash": "",
+        "when": "0001-01-01T00:00:00Z",
+    });
+    if let Ok(commits) = repo.commits(&branch, 0, 1) {
+        if let Some(tip) = commits.first() {
+            response["hash"] = json!(tip.sha);
+            response["when"] = json!(tip.date);
+            response["shortHash"] = json!(&tip.sha[..7.min(tip.sha.len())]);
+            if !tip.message.is_empty() {
+                response["message"] = json!(tip.message);
+            }
+            response["author"] = json!({
+                "name": tip.author,
+                "email": "",
+                "when": tip.date,
+            });
+        }
+    }
+
+    Ok(Json(response))
 }

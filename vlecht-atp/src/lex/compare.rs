@@ -9,14 +9,14 @@ use serde_json::{json, Value};
 
 /// `sh.tangled.repo.compare` — diff between two refs.
 ///
-/// Query params: `repo`, `base`, `head`.
+/// Query params: `repo`, `rev1`, `rev2`.
 /// Output: matches the Go knotserver's `RepoFormatPatchResponse` shape:
-/// `{"rev1", "rev2", "patch", "format_patch": [...]}`.
+/// `{"rev1", "rev2", "patch"}`.
 #[derive(Deserialize)]
 pub struct Params {
     pub repo: String,
-    pub base: String,
-    pub head: String,
+    pub rev1: String,
+    pub rev2: String,
 }
 
 pub async fn handler(
@@ -27,12 +27,12 @@ pub async fn handler(
     let repo = GitRepo::open(&path).map_err(|e| XrpcError::InternalServerError(e.to_string()))?;
 
     let patch = repo
-        .diff(Some(&p.base), Some(&p.head))
+        .diff(Some(&p.rev1), Some(&p.rev2))
         .map_err(|e| XrpcError::InternalServerError(e.to_string()))?;
 
     Ok(Json(json!({
-        "rev1": p.base,
-        "rev2": p.head,
+        "rev1": p.rev1,
+        "rev2": p.rev2,
         "patch": patch,
     })))
 }

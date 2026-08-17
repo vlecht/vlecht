@@ -1,4 +1,5 @@
 use crate::error::XrpcError;
+use crate::lex::authz::assert_owns_by_repo;
 use crate::lex::maybe_auth::MaybeAuth;
 use crate::lex::resolve::resolve_repo_path;
 use crate::lex::LexState;
@@ -20,9 +21,10 @@ pub struct Input {
 
 pub async fn handler(
     State(state): State<LexState>,
-    _auth: MaybeAuth,
+    MaybeAuth(actor_did): MaybeAuth,
     Json(body): Json<Input>,
 ) -> Result<Json<Value>, XrpcError> {
+    let _repo_did = assert_owns_by_repo(&state, &actor_did, &body.repo).await?;
     let repo_path = resolve_repo_path(&state, &body.repo).await?;
     let repo = GitRepo::open(&repo_path)
         .map_err(|e| XrpcError::InternalServerError(e.to_string()))?;

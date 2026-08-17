@@ -1,46 +1,46 @@
 use crate::error::XrpcError;
+use crate::lex::authz::assert_owns_by_name;
 use crate::lex::maybe_auth::MaybeAuth;
 use crate::lex::resolve::resolve_repo_path;
 use crate::lex::LexState;
 use axum::extract::State;
 use axum::Json;
-use vlecht_db::RepoStore;
 use vlecht_git::GitRepo;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
 /// `sh.tangled.repo.forkSync` — sync fork from upstream. Protected by service auth.
 ///
-/// Body: `{ did: String, name: String, branch: String }`
+/// Body: `{ did: String, name: String, branch: String, hiddenRef: String }`
 #[derive(Deserialize)]
 pub struct Input {
     pub did: String,
     pub name: String,
     pub branch: String,
+    #[serde(rename = "hiddenRef")]
+    pub hidden_ref: String,
 }
 
 pub async fn handler(
     State(state): State<LexState>,
-    _auth: MaybeAuth,
+    MaybeAuth(actor_did): MaybeAuth,
     Json(body): Json<Input>,
 ) -> Result<Json<Value>, XrpcError> {
-    let repo_did = state
-        .db
-        .get_repo_did_by_name(&body.did, &body.name)
-        .await
-        .map_err(|_| XrpcError::RepoNotFound(format!("{}/{}", body.did, body.name)))?;
+    let repo_did =
+        assert_owns_by_name(&state, &actor_did, &body.did, &body.name).await?;
 
     let repo_path = resolve_repo_path(&state, &repo_did).await?;
     let repo = GitRepo::open(&repo_path)
         .map_err(|e| XrpcError::InternalServerError(e.to_string()))?;
 
-    // Try to fast-forward the branch to the hidden upstream ref
-    let hidden_name = format!("upstream/{}/{}", body.did, body.name);
+    // Fast-forward the branch to the hidden upstream ref. The hidden ref
+    // name is supplied by the client (set via hiddenRef), so forkSync and
+    // hiddenRef share the same naming convention.
     let upstream = repo
-        .get_hidden_ref(&hidden_name)
+        .get_hidden_ref(&body.hidden_ref)
         .map_err(|e| XrpcError::InternalServerError(e.to_string()))?
         .ok_or_else(|| {
-            XrpcError::RefNotFound(format!("no upstream tracking ref for {}/{}", body.did, body.name))
+            XrpcError::RefNotFound(format!("hidden ref: {}", body.hidden_ref))
         })?;
 
     // Check if this is a fast-forward

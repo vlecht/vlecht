@@ -4,17 +4,19 @@ use crate::lex::LexState;
 use axum::extract::State;
 use axum::Json;
 use vlecht_db::RepoStore;
+use vlecht_git::paths::join_safe;
 use vlecht_git::GitRepo;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
 /// `sh.tangled.repo.create` — create a new bare repository.
 ///
-/// Body: `{ name: String, defaultBranch?: String }`
+/// Body: `{ name: String, rkey: String, defaultBranch?: String }`
 /// Returns: `{ repoDid: String }`
 #[derive(Deserialize)]
 pub struct Input {
     pub name: String,
+    pub rkey: String,
     #[serde(default)]
     pub default_branch: Option<String>,
 }
@@ -26,20 +28,29 @@ pub async fn handler(
 ) -> Result<Json<Value>, XrpcError> {
     let default_branch = body.default_branch.as_deref().unwrap_or("main");
 
-    // Validate repo name
+    // Validate repo name + rkey (rkey becomes a path segment — must be safe).
     validate_repo_name(&body.name)?;
+    validate_repo_name(&body.rkey)?;
 
-    // Generate a repo DID from the actor DID + repo name
-    let repo_did = actor_did
-        .strip_prefix("did:plc:")
-        .or_else(|| actor_did.strip_prefix("did:web:"))
-        .map(|stripped| format!("did:plc:{stripped}.{name}", name = body.name))
-        .unwrap_or_else(|| format!("did:plc:{}", body.name));
+    // Generate a deterministic repo DID from the owner DID + rkey.
+    // In production, the Go server registers a real did:plc with the PLC
+    // directory. Vlecht (MVP) generates a synthetic but deterministic DID
+    // by hashing owner_did + ":" + rkey — collision-free and stable across
+    // restarts, though not a real PLC-registered DID.
+    let repo_did = {
+        use sha2::Digest;
+        let mut hasher = sha2::Sha256::new();
+        hasher.update(actor_did.as_bytes());
+        hasher.update(b":");
+        hasher.update(body.rkey.as_bytes());
+        let hash = hasher.finalize();
+        format!("did:plc:{}", hex::encode(&hash[..16]))
+    };
 
-    // Check if repo already exists
+    // Check if repo already exists (by rkey — same as Go's primary check)
     if state
         .db
-        .get_repo_did_by_name(&actor_did, &body.name)
+        .get_repo_did_by_name(&actor_did, &body.rkey)
         .await
         .is_ok()
     {
@@ -53,18 +64,23 @@ pub async fn handler(
         .await
         .map_err(|e| XrpcError::InternalServerError(e.to_string()))?;
 
-    // Create repo on disk
-    let repo_path = state.repo_scan_path.join(&actor_did).join(&body.name);
-    std::fs::create_dir_all(repo_path.parent().unwrap())
+    // Create repo on disk (path = <owner>/<rkey>). join_safe rejects any
+    // segment that could escape the scan root via `..` or separators.
+    let repo_path = join_safe(&state.repo_scan_path, &[&actor_did, &body.rkey])
+        .ok_or_else(|| XrpcError::InvalidRequest("invalid repository path".into()))?;
+    let parent = repo_path
+        .parent()
+        .ok_or_else(|| XrpcError::InvalidRequest("invalid repository path".into()))?;
+    std::fs::create_dir_all(parent)
         .map_err(|e| XrpcError::InternalServerError(e.to_string()))?;
 
     GitRepo::init_bare(&repo_path, default_branch)
         .map_err(|e| XrpcError::InternalServerError(e.to_string()))?;
 
-    // Track in DB
+    // Track in DB — uses rkey as the alias
     state
         .db
-        .create_repo(&repo_did, None, &actor_did, &body.name, "k256")
+        .create_repo(&repo_did, None, &actor_did, &body.rkey, "k256")
         .await
         .map_err(|e| XrpcError::InternalServerError(e.to_string()))?;
 
@@ -82,22 +98,39 @@ fn validate_repo_name(name: &str) -> Result<(), XrpcError> {
             "repository name must be 100 characters or fewer".into(),
         ));
     }
-    if name.contains('/') || name.contains('\\') {
+    // check for path traversal attempts
+    if name == "." || name == ".." || name.contains('/') || name.contains('\\') {
         return Err(XrpcError::InvalidRequest(
             "repository name contains invalid path characters".into(),
         ));
     }
+    // check for sequences that could be used for traversal when normalized
+    if name.contains("./") || name.contains("../")
+        || name.starts_with('.') || name.ends_with('.')
+    {
+        return Err(XrpcError::InvalidRequest(
+            "repository name contains invalid path sequence".into(),
+        ));
+    }
+    // prevent multiple sequential dots
     if name.contains("..") {
         return Err(XrpcError::InvalidRequest(
             "repository name cannot contain sequential dots".into(),
         ));
     }
+    // character validation
     for ch in name.chars() {
         if !ch.is_ascii_alphanumeric() && ch != '-' && ch != '_' && ch != '.' {
-            return Err(XrpcError::InvalidRequest(format!(
-                "repository name can only contain alphanumeric characters, periods, hyphens, and underscores"
-            )));
+            return Err(XrpcError::InvalidRequest(
+                "repository name can only contain alphanumeric characters, periods, hyphens, and underscores".into(),
+            ));
         }
+    }
+    // reserved names
+    if name.eq_ignore_ascii_case("self") {
+        return Err(XrpcError::InvalidRequest(format!(
+            "repository name {name:?} is reserved"
+        )));
     }
     Ok(())
 }

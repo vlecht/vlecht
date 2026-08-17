@@ -1,15 +1,12 @@
-use crate::auth::AuthMode;
 use std::path::PathBuf;
 
 pub struct AuthConfig {
-    pub mode: AuthMode,
     pub did_header: String,
 }
 
 impl Default for AuthConfig {
     fn default() -> Self {
         Self {
-            mode: AuthMode::Disabled,
             did_header: "X-Vlecht-DID".into(),
         }
     }
@@ -22,14 +19,12 @@ pub struct Config {
     pub hostname: String,
     pub auth: AuthConfig,
     pub ssh_port: u16,
+    /// Path to the SSH host key (PKCS8 PEM). Generated on first start if absent.
+    pub ssh_host_key_path: PathBuf,
 }
 
 impl Config {
     pub fn from_env() -> anyhow::Result<Self> {
-        let auth_mode = match std::env::var("VLECHT_AUTH_MODE") {
-            Ok(val) if val == "proxy" => AuthMode::Proxy,
-            _ => AuthMode::Disabled,
-        };
         let did_header =
             std::env::var("VLECHT_AUTH_DID_HEADER").unwrap_or_else(|_| "X-Vlecht-DID".into());
 
@@ -47,10 +42,10 @@ impl Config {
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(2222),
-            auth: AuthConfig {
-                mode: auth_mode,
-                did_header,
-            },
+            ssh_host_key_path: std::env::var("VLECHT_SSH_HOST_KEY_PATH")
+                .map(PathBuf::from)
+                .unwrap_or_else(|_| PathBuf::from("./vlecht-ssh-host-key")),
+            auth: AuthConfig { did_header },
         })
     }
 }

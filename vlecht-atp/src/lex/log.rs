@@ -10,7 +10,7 @@ use serde_json::{json, Value};
 /// `sh.tangled.repo.log` — paginated commit history.
 ///
 /// Query params: `repo`, `ref` (default branch), `limit` (default 50, max 100),
-/// `cursor` (offset).
+/// `cursor` (offset), `path` (optional path filter, stored as `description`).
 #[derive(Deserialize)]
 pub struct Params {
     pub repo: String,
@@ -20,6 +20,8 @@ pub struct Params {
     pub limit: Option<i64>,
     #[serde(default)]
     pub cursor: Option<i64>,
+    #[serde(default)]
+    pub path: Option<String>,
 }
 
 pub async fn handler(
@@ -48,6 +50,8 @@ pub async fn handler(
         .map(|c| c.len())
         .unwrap_or(commits.len());
 
+    let description = p.path.as_deref().map(|s| s.to_string());
+
     let items: Vec<Value> = commits
         .into_iter()
         .map(|c| {
@@ -69,11 +73,16 @@ pub async fn handler(
         })
         .collect();
 
-    Ok(Json(json!({
+    let mut body = json!({
         "commits": items,
         "ref": ref_name,
         "page": (offset / limit.max(1)) + 1,
         "perPage": limit,
         "total": total,
-    })))
+        "log": true,
+    });
+    if let Some(desc) = description {
+        body["description"] = json!(desc);
+    }
+    Ok(Json(body))
 }

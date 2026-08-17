@@ -11,6 +11,7 @@
 // real source of truth for the contract.
 
 pub mod archive;
+pub mod authz;
 pub mod blob;
 pub mod branch;
 pub mod branches;
@@ -38,37 +39,40 @@ pub mod tags;
 pub mod tree;
 pub mod version;
 
-use crate::identity::AtpIdentity;
 use axum::middleware;
 use axum::routing::{get, post};
 use axum::Router;
 use jacquard_axum::service_auth::{self, ServiceAuthConfig};
-use jacquard_identity::JacquardResolver;
+use jacquard_identity::resolver::IdentityResolver;
 use vlecht_db::Db;
 use std::path::PathBuf;
-use std::sync::Arc;
 
 /// Shared state for the XRPC handlers. Cheap to clone.
+///
+/// The service-auth configuration is NOT stored here — it's passed to
+/// [`router`] separately so that tests can inject a mock resolver without
+/// making this struct generic.
 #[derive(Clone)]
 pub struct LexState {
     pub db: Db,
-    pub identity: AtpIdentity,
     /// Server version string, surfaced by `sh.tangled.knot.version`.
     pub version: String,
     /// Server owner DID, surfaced by `sh.tangled.owner`.
     pub owner_did: String,
     /// Root directory under which bare repos are stored.
     pub repo_scan_path: PathBuf,
-    /// Service auth config for write endpoints. None = ATproto disabled.
-    pub service_auth: Arc<Option<ServiceAuthConfig<JacquardResolver>>>,
-    /// Dev/test DID for bypassing service auth. Set from `VLECHT_ATP_DEV_DID`
-    /// at startup; empty in production.
-    pub dev_did: Option<String>,
 }
 /// Build the XRPC sub-router including both public read endpoints and
 /// service-auth-protected write endpoints. Mount under `/xrpc` in the main app.
-pub fn router(state: LexState) -> Router {
-    let sa_cfg = (*state.service_auth).clone();
+///
+/// `sa_cfg` is the optional service-auth configuration. When present, the
+/// write router gets `service_auth_middleware` applied, which validates real
+/// AT Protocol service auth tokens. When `None`, write endpoints return 401
+/// (there is no bypass mode).
+pub fn router<R>(state: LexState, sa_cfg: Option<ServiceAuthConfig<R>>) -> Router
+where
+    R: IdentityResolver + Clone + Send + Sync + 'static,
+{
 
     let public = Router::new()
         // knot.*
@@ -97,7 +101,7 @@ pub fn router(state: LexState) -> Router {
         .with_state(state.clone());
 
     // Write endpoints — always mounted. Protected by service auth middleware
-    // when configured; falls back to `VLECHT_ATP_DEV_DID` env var in dev/test.
+    // when configured; without it, write endpoints return 401 (no bypass).
     let mut write = Router::new()
         .route("/sh.tangled.repo.create", post(create_repo::handler))
         .route("/sh.tangled.repo.delete", post(delete_repo::handler))
@@ -118,7 +122,7 @@ pub fn router(state: LexState) -> Router {
     if let Some(cfg) = sa_cfg {
         write = write.layer(middleware::from_fn_with_state(
             cfg,
-            service_auth::service_auth_middleware::<ServiceAuthConfig<JacquardResolver>>,
+            service_auth::service_auth_middleware::<ServiceAuthConfig<R>>,
         ));
     }
 

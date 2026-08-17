@@ -1,11 +1,30 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU16, Ordering};
+use std::sync::OnceLock;
+use vlecht_db::RepoStore;
 
 static NEXT_PORT: AtomicU16 = AtomicU16::new(15000);
 
 fn unique_port() -> u16 {
     NEXT_PORT.fetch_add(1, Ordering::SeqCst)
+}
+
+/// Generate a single SSH key pair once and reuse it across all SSH tests.
+/// Avoids the ~200ms `ssh-keygen` cost per test.
+fn shared_ssh_key() -> PathBuf {
+    static KEY: OnceLock<PathBuf> = OnceLock::new();
+    KEY.get_or_init(|| {
+        let key = std::env::temp_dir().join("vlecht_e2e_shared_ed25519");
+        let _ = std::fs::remove_file(&key);
+        let _ = std::fs::remove_file(key.with_extension("pub"));
+        let out = Command::new("ssh-keygen")
+            .args(["-t", "ed25519", "-f", key.to_str().unwrap(), "-N", "", "-q"])
+            .output()
+            .expect("ssh-keygen should be installed");
+        assert!(out.status.success(), "ssh-keygen failed: {}", String::from_utf8_lossy(&out.stderr));
+        key
+    }).clone()
 }
 
 /// Create an empty temporary directory for a test.
@@ -22,6 +41,7 @@ struct ServerHandle {
     http_port: u16,
     ssh_port: u16,
     ssh_key: PathBuf,
+    db: vlecht_db::Db,
 }
 
 impl ServerHandle {
@@ -36,6 +56,7 @@ impl ServerHandle {
 
         let db = vlecht_db::Db::open(&db_path).await.unwrap();
         db.migrate().await.unwrap();
+        let db_handle = db.clone();
         let ssh = ssh_port.unwrap_or(0);
         let cfg = vlecht::config::Config {
             listen_addr: format!("127.0.0.1:{http_port}"),
@@ -44,30 +65,24 @@ impl ServerHandle {
             hostname: "localhost".into(),
             auth: Default::default(),
             ssh_port: ssh,
+            ssh_host_key_path: tmpdir.join("ssh-host-key"),
         };
 
         let state = vlecht::build_state(db, std::sync::Arc::new(cfg));
 
-        // Generate an ed25519 key pair for SSH tests
-        let ssh_key = tmpdir.join("test_ed25519");
+        // Generate a shared SSH key pair once and reuse across all SSH tests.
+        let ssh_key = shared_ssh_key();
+
+        // Register the SSH key so the test client can authenticate as alice.
+        // Identity comes from the key; the username is ignored by the server.
         if ssh_port.is_some() {
-            let out = Command::new("ssh-keygen")
-                .args([
-                    "-t",
-                    "ed25519",
-                    "-f",
-                    ssh_key.to_str().unwrap(),
-                    "-N",
-                    "",
-                    "-q",
-                ])
-                .output()
-                .expect("ssh-keygen should be installed");
-            assert!(
-                out.status.success(),
-                "ssh-keygen failed: {}",
-                String::from_utf8_lossy(&out.stderr)
-            );
+            let pub_str =
+                std::fs::read_to_string(ssh_key.with_extension("pub")).expect("read ssh pub key");
+            db_handle.add_did("did:plc:alice").await.unwrap();
+            db_handle
+                .add_public_key("did:plc:alice", pub_str.trim(), "1970-01-01T00:00:00Z")
+                .await
+                .unwrap();
         }
 
         // SSH server
@@ -101,6 +116,7 @@ impl ServerHandle {
             http_port,
             ssh_port: ssh,
             ssh_key,
+            db: db_handle,
         }
     }
 
@@ -128,10 +144,17 @@ impl ServerHandle {
         )
     }
 
-    fn init_repo(&self, owner: &str, name: &str) -> PathBuf {
+    async fn init_repo(&self, owner: &str, name: &str) -> PathBuf {
         let path = self.tmpdir.join("repos").join(owner).join(name);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         vlecht_git::GitRepo::init_bare(&path, "main").unwrap();
+        // Track in DB so ownership auth passes for pushes.
+        let owner_did = format!("did:plc:{owner}");
+        self.db.add_did(&owner_did).await.unwrap();
+        self.db
+            .create_repo(&owner_did, None, &owner_did, name, "k256")
+            .await
+            .unwrap();
         path
     }
 
@@ -204,6 +227,33 @@ fn git(repo: &Path, args: &[&str]) {
     }
 }
 
+/// Like `git`, but injects the `X-Vlecht-DID` auth header. Use for pushes
+/// (git-receive-pack) which require an authenticated owner DID.
+fn git_push(repo: &Path, args: &[&str], did: &str) {
+    let extra = format!("http.extraHeader=X-Vlecht-DID: {did}");
+    let mut cmd = vec!["-c", "init.defaultBranch=main"];
+    cmd.extend(git_global_config());
+    cmd.push("-c");
+    cmd.push(&extra);
+    cmd.extend(args);
+    let full_args: Vec<&str> = cmd.iter().copied().collect();
+    let out = Command::new("git")
+        .args(&full_args)
+        .current_dir(repo)
+        .env("GIT_ASKPASS", "/bin/true")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .output()
+        .expect("git should be installed");
+    if !out.status.success() {
+        panic!(
+            "git push {:?} failed:\nstdout: {}\nstderr: {}",
+            args,
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr),
+        );
+    }
+}
+
 fn git_output(repo: &Path, args: &[&str]) -> String {
     let mut cmd = vec!["-c", "init.defaultBranch=main"];
     cmd.extend(git_global_config());
@@ -246,7 +296,7 @@ async fn e2e_git_clone() {
     let port = unique_port();
     let server = ServerHandle::start(port, None).await;
 
-    let repo_path = server.init_repo("alice", "myrepo");
+    let repo_path = server.init_repo("alice", "myrepo").await;
     let wd = server.workdir("clone_work");
 
     // Seed the repo with a commit
@@ -276,7 +326,7 @@ async fn e2e_git_clone() {
 async fn e2e_git_push() {
     let port = unique_port();
     let server = ServerHandle::start(port, None).await;
-    let repo_path = server.init_repo("alice", "pushrepo");
+    let repo_path = server.init_repo("alice", "pushrepo").await;
     let wd = server.workdir("push_work");
     let local = wd.join("local");
     std::fs::create_dir_all(&local).unwrap();
@@ -289,7 +339,7 @@ async fn e2e_git_push() {
 
     let remote = format!("http://127.0.0.1:{port}/alice/pushrepo");
     git(&local, &["remote", "add", "origin", &remote]);
-    git(&local, &["push", "origin", "main"]);
+    git_push(&local, &["push", "origin", "main"], "did:plc:alice");
 
     let repo = vlecht_git::GitRepo::open(&repo_path).unwrap();
     let commits = repo.commits("main", 0, 10).unwrap();
@@ -301,7 +351,7 @@ async fn e2e_git_push() {
 async fn e2e_git_push_two_commits() {
     let port = unique_port();
     let server = ServerHandle::start(port, None).await;
-    let repo_path = server.init_repo("alice", "twopush");
+    let repo_path = server.init_repo("alice", "twopush").await;
     let wd = server.workdir("twopush_work");
     let local = wd.join("local");
     std::fs::create_dir_all(&local).unwrap();
@@ -319,12 +369,12 @@ async fn e2e_git_push_two_commits() {
             format!("http://127.0.0.1:{port}/alice/twopush").as_str(),
         ],
     );
-    git(&local, &["push", "origin", "main"]);
+    git_push(&local, &["push", "origin", "main"], "did:plc:alice");
 
     std::fs::write(local.join("b.txt"), "b\n").unwrap();
     git(&local, &["add", "."]);
     git(&local, &["commit", "-m", "second"]);
-    git(&local, &["push", "origin", "main"]);
+    git_push(&local, &["push", "origin", "main"], "did:plc:alice");
 
     let repo = vlecht_git::GitRepo::open(&repo_path).unwrap();
     let commits = repo.commits("main", 0, 10).unwrap();
@@ -336,7 +386,7 @@ async fn e2e_git_push_two_commits() {
 async fn e2e_git_ls_remote() {
     let port = unique_port();
     let server = ServerHandle::start(port, None).await;
-    let repo_path = server.init_repo("alice", "lsremote");
+    let repo_path = server.init_repo("alice", "lsremote").await;
     let wd = server.workdir("ls_work");
     let local = wd.join("src");
     std::fs::create_dir_all(&local).unwrap();
@@ -347,7 +397,7 @@ async fn e2e_git_ls_remote() {
     git(&local, &["commit", "-m", "init"]);
     let remote = format!("http://127.0.0.1:{port}/alice/lsremote");
     git(&local, &["remote", "add", "origin", &remote]);
-    git(&local, &["push", "origin", "main"]);
+    git_push(&local, &["push", "origin", "main"], "did:plc:alice");
 
     let output = git_output(&local, &["ls-remote", &remote]);
     assert!(
@@ -360,7 +410,7 @@ async fn e2e_git_ls_remote() {
 async fn e2e_git_push_new_branch() {
     let port = unique_port();
     let server = ServerHandle::start(port, None).await;
-    let repo_path = server.init_repo("alice", "newbranch");
+    let repo_path = server.init_repo("alice", "newbranch").await;
     let wd = server.workdir("nb_work");
     let local = wd.join("local");
     std::fs::create_dir_all(&local).unwrap();
@@ -372,12 +422,12 @@ async fn e2e_git_push_new_branch() {
 
     let remote = format!("http://127.0.0.1:{port}/alice/newbranch");
     git(&local, &["remote", "add", "origin", &remote]);
-    git(&local, &["push", "origin", "main"]);
+    git_push(&local, &["push", "origin", "main"], "did:plc:alice");
     git(&local, &["checkout", "-b", "feature"]);
     std::fs::write(local.join("feat.txt"), "feat\n").unwrap();
     git(&local, &["add", "."]);
     git(&local, &["commit", "-m", "feature work"]);
-    git(&local, &["push", "origin", "feature"]);
+    git_push(&local, &["push", "origin", "feature"], "did:plc:alice");
 
     let repo = vlecht_git::GitRepo::open(&repo_path).unwrap();
     let branches = repo.branches().unwrap();
@@ -389,7 +439,7 @@ async fn e2e_git_push_new_branch() {
 async fn e2e_git_push_delete_branch() {
     let port = unique_port();
     let server = ServerHandle::start(port, None).await;
-    let repo_path = server.init_repo("alice", "deletebranch");
+    let repo_path = server.init_repo("alice", "deletebranch").await;
     let wd = server.workdir("db_work");
     let local = wd.join("local");
     std::fs::create_dir_all(&local).unwrap();
@@ -401,8 +451,8 @@ async fn e2e_git_push_delete_branch() {
 
     let remote = format!("http://127.0.0.1:{port}/alice/deletebranch");
     git(&local, &["remote", "add", "origin", &remote]);
-    git(&local, &["push", "origin", "main"]);
-    git(&local, &["push", "origin", "main:to-delete"]);
+    git_push(&local, &["push", "origin", "main"], "did:plc:alice");
+    git_push(&local, &["push", "origin", "main:to-delete"], "did:plc:alice");
     // Verify the branch was created
     let branches = vlecht_git::GitRepo::open(&repo_path)
         .unwrap()
@@ -424,7 +474,7 @@ async fn e2e_git_push_delete_branch() {
         "to-delete should appear in ls-remote before delete\n{ls}"
     );
     // Delete with full refspec
-    git(&local, &["push", "origin", ":refs/heads/to-delete"]);
+    git_push(&local, &["push", "origin", ":refs/heads/to-delete"], "did:plc:alice");
 
     let branches = vlecht_git::GitRepo::open(&repo_path)
         .unwrap()
@@ -438,7 +488,7 @@ async fn e2e_git_push_delete_branch() {
 async fn e2e_git_pull_after_push() {
     let port = unique_port();
     let server = ServerHandle::start(port, None).await;
-    let repo_path = server.init_repo("alice", "pulltest");
+    let repo_path = server.init_repo("alice", "pulltest").await;
     let wd = server.workdir("pull_work");
 
     let local = wd.join("local");
@@ -450,7 +500,7 @@ async fn e2e_git_pull_after_push() {
 
     let remote = format!("http://127.0.0.1:{port}/alice/pulltest");
     git(&local, &["remote", "add", "origin", &remote]);
-    git(&local, &["push", "origin", "main"]);
+    git_push(&local, &["push", "origin", "main"], "did:plc:alice");
 
     let clone_dir = wd.join("clone");
     git(&wd, &["clone", &remote, clone_dir.to_str().unwrap()]);
@@ -462,7 +512,7 @@ async fn e2e_git_pull_after_push() {
     std::fs::write(local.join("f.txt"), "v2\n").unwrap();
     git(&local, &["add", "."]);
     git(&local, &["commit", "-m", "v2"]);
-    git(&local, &["push", "origin", "main"]);
+    git_push(&local, &["push", "origin", "main"], "did:plc:alice");
 
     git(&clone_dir, &["pull", &remote, "main"]);
     assert_eq!(
@@ -475,7 +525,7 @@ async fn e2e_git_pull_after_push() {
 async fn e2e_browse_api() {
     let port = unique_port();
     let server = ServerHandle::start(port, None).await;
-    let repo_path = server.init_repo("alice", "browse");
+    let repo_path = server.init_repo("alice", "browse").await;
     let wd = server.workdir("browse_work");
     let local = wd.join("src");
     std::fs::create_dir_all(&local).unwrap();
@@ -495,7 +545,7 @@ async fn e2e_browse_api() {
             format!("http://127.0.0.1:{port}/alice/browse").as_str(),
         ],
     );
-    git(&local, &["push", "origin", "main"]);
+    git_push(&local, &["push", "origin", "main"], "did:plc:alice");
 
     let base = format!("http://127.0.0.1:{port}/alice/browse");
 
@@ -526,6 +576,7 @@ async fn e2e_create_repo_via_api() {
 
     let resp = reqwest::Client::new()
         .post(format!("http://127.0.0.1:{port}/api/repos"))
+        .header("X-Vlecht-DID", "did:plc:alice")
         .json(&serde_json::json!({"owner": "alice", "name": "apicreated"}))
         .send()
         .await
@@ -540,6 +591,7 @@ async fn e2e_create_and_push_to_new_repo() {
 
     let resp = reqwest::Client::new()
         .post(format!("http://127.0.0.1:{port}/api/repos"))
+        .header("X-Vlecht-DID", "did:plc:bob")
         .json(&serde_json::json!({"owner": "bob", "name": "newrepo"}))
         .send()
         .await
@@ -563,13 +615,87 @@ async fn e2e_create_and_push_to_new_repo() {
             format!("http://127.0.0.1:{port}/bob/newrepo").as_str(),
         ],
     );
-    git(&local, &["push", "origin", "main"]);
+    git_push(&local, &["push", "origin", "main"], "did:plc:bob");
 
     let repo =
         vlecht_git::GitRepo::open(&server.tmpdir.join("repos").join("bob").join("newrepo")).unwrap();
     let commits = repo.commits("main", 0, 10).unwrap();
     assert_eq!(commits.len(), 1);
     assert!(commits[0].message.contains("first"));
+}
+
+// ---------------------------------------------------------------------------
+// Path-traversal protection tests
+
+/// `DELETE /api/repos/{owner}/{repo}` must not escape the repo scan root when
+/// the path params contain `..`. Regression guard for the arbitrary-delete
+/// primitive: without containment, `DELETE /api/repos/..%2F..%2Fvictim/`
+/// would `remove_dir_all` outside the scan path.
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_path_traversal_delete_rejected() {
+    let port = unique_port();
+    let server = ServerHandle::start(port, None).await;
+
+    // Plant a "victim" directory OUTSIDE the scan root that an attacker
+    // would try to delete.
+    let victim = server.tmpdir.join("outside_victim");
+    std::fs::create_dir_all(&victim).unwrap();
+    std::fs::write(victim.join("sentinel"), "do not delete\n").unwrap();
+
+    // Attempt the traversal via the delete endpoint. axum doesn't normalize
+    // `..`, so `%2F`-decoded or raw `..` reaches the handler as a segment.
+    for attempt in &[
+        "/api/repos/..%2F..%2Foutside_victim/x",
+        "/api/repos/../../../../etc/hosts",
+    ] {
+        let url = format!("http://127.0.0.1:{port}{attempt}");
+        reqwest::Client::new()
+            .delete(&url)
+            .header("X-Vlecht-DID", "did:plc:alice")
+            .send()
+            .await
+            .unwrap();
+    }
+
+    // The outside-root sentinel must survive every attempt.
+    assert!(
+        victim.join("sentinel").exists(),
+        "path traversal deleted a file outside the scan root!"
+    );
+}
+
+/// Create-repo with a traversal-shaped name/rkey must be rejected, not create
+/// a repo outside the scan root.
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_path_traversal_create_rejected() {
+    let port = unique_port();
+    let server = ServerHandle::start(port, None).await;
+
+    for bad in &[
+        serde_json::json!({"owner": "..", "name": "evil"}),
+        serde_json::json!({"owner": "alice", "name": "../evil"}),
+        serde_json::json!({"owner": "alice", "name": "a/b"}),
+    ] {
+        let resp = reqwest::Client::new()
+            .post(format!("http://127.0.0.1:{port}/api/repos"))
+            .header("X-Vlecht-DID", "did:plc:alice")
+            .json(bad)
+            .send()
+            .await
+            .unwrap();
+        assert!(
+            resp.status().is_client_error(),
+            "traversal name {:?} should be rejected, got {}",
+            bad,
+            resp.status()
+        );
+    }
+
+    let outside = server.tmpdir.join("evil");
+    assert!(
+        !outside.exists(),
+        "traversal created a repo outside the scan root!"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -632,7 +758,7 @@ async fn ssh_git_clone() {
     let server = ServerHandle::start(http_port, Some(ssh_port)).await;
     let ssh_cmd = server.ssh_command();
 
-    let repo_path = server.init_repo("alice", "myrepo");
+    let repo_path = server.init_repo("alice", "myrepo").await;
     let wd = server.workdir("ssh_clone_work");
 
     // Seed the repo via local push
@@ -671,7 +797,7 @@ async fn ssh_git_push() {
     let ssh_port = unique_port();
     let server = ServerHandle::start(http_port, Some(ssh_port)).await;
     let ssh_cmd = server.ssh_command();
-    let repo_path = server.init_repo("alice", "pushrepo");
+    let repo_path = server.init_repo("alice", "pushrepo").await;
     let wd = server.workdir("ssh_push_work");
     let local = wd.join("local");
     std::fs::create_dir_all(&local).unwrap();
@@ -705,7 +831,7 @@ async fn ssh_git_push_two_commits() {
     let ssh_port = unique_port();
     let server = ServerHandle::start(http_port, Some(ssh_port)).await;
     let ssh_cmd = server.ssh_command();
-    let repo_path = server.init_repo("alice", "twopush");
+    let repo_path = server.init_repo("alice", "twopush").await;
     let wd = server.workdir("ssh_twopush_work");
     let local = wd.join("local");
     std::fs::create_dir_all(&local).unwrap();
@@ -743,7 +869,7 @@ async fn ssh_git_ls_remote() {
     let ssh_port = unique_port();
     let server = ServerHandle::start(http_port, Some(ssh_port)).await;
     let ssh_cmd = server.ssh_command();
-    let _repo_path = server.init_repo("alice", "lsremote");
+    let _repo_path = server.init_repo("alice", "lsremote").await;
     let wd = server.workdir("ssh_ls_work");
     let local = wd.join("src");
     std::fs::create_dir_all(&local).unwrap();
@@ -769,7 +895,7 @@ async fn ssh_git_push_new_branch() {
     let ssh_port = unique_port();
     let server = ServerHandle::start(http_port, Some(ssh_port)).await;
     let ssh_cmd = server.ssh_command();
-    let repo_path = server.init_repo("alice", "newbranch");
+    let repo_path = server.init_repo("alice", "newbranch").await;
     let wd = server.workdir("ssh_nb_work");
     let local = wd.join("local");
     std::fs::create_dir_all(&local).unwrap();
@@ -808,7 +934,7 @@ async fn ssh_git_push_delete_branch() {
     let ssh_port = unique_port();
     let server = ServerHandle::start(http_port, Some(ssh_port)).await;
     let ssh_cmd = server.ssh_command();
-    let repo_path = server.init_repo("alice", "deletebranch");
+    let repo_path = server.init_repo("alice", "deletebranch").await;
     let wd = server.workdir("ssh_db_work");
     let local = wd.join("local");
     std::fs::create_dir_all(&local).unwrap();
@@ -857,7 +983,7 @@ async fn ssh_git_pull_after_push() {
     let ssh_port = unique_port();
     let server = ServerHandle::start(http_port, Some(ssh_port)).await;
     let ssh_cmd = server.ssh_command();
-    let _repo_path = server.init_repo("alice", "pulltest");
+    let _repo_path = server.init_repo("alice", "pulltest").await;
     let wd = server.workdir("ssh_pull_work");
     let remote = server.ssh_url("alice", "pulltest");
 
@@ -917,7 +1043,7 @@ async fn e2e_xrpc_version_reachable() {
 async fn e2e_xrpc_branches_returns_repo_branches() {
     let port = unique_port();
     let server = ServerHandle::start(port, None).await;
-    let _repo = server.init_repo("alice", "xrpc-smoke");
+    let _repo = server.init_repo("alice", "xrpc-smoke").await;
     let resp = reqwest::get(&format!(
         "http://127.0.0.1:{port}/xrpc/sh.tangled.repo.branches?repo=alice/xrpc-smoke"
     ))

@@ -1,4 +1,5 @@
 use crate::error::XrpcError;
+use crate::lex::authz::assert_owns_by_name;
 use crate::lex::maybe_auth::MaybeAuth;
 use crate::lex::resolve::resolve_repo_path;
 use crate::lex::LexState;
@@ -24,18 +25,7 @@ pub async fn handler(
     MaybeAuth(actor_did): MaybeAuth,
     Json(body): Json<Input>,
 ) -> Result<Json<Value>, XrpcError> {
-
-    // Verify the actor DID matches the owner
-    if actor_did != body.did {
-        return Err(XrpcError::Unauthorized);
-    }
-
-    // Resolve the repo DID
-    let repo_did = state
-        .db
-        .get_repo_did_by_name(&body.did, &body.name)
-        .await
-        .map_err(|_| XrpcError::RepoNotFound(format!("{}/{}", body.did, body.name)))?;
+    let repo_did = assert_owns_by_name(&state, &actor_did, &body.did, &body.name).await?;
 
     // Find and remove the repo from disk
     let repo_path = resolve_repo_path(&state, &repo_did).await?;

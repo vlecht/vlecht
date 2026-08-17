@@ -57,31 +57,20 @@ pub async fn handler(
         if head_is_ancestor {
             // Target is behind head — up to date, no conflict
         } else {
-            // Three-way merge needed. For MVP, check if head is ancestor of target.
             let target_is_behind = repo.is_ancestor(&default_branch, target).unwrap_or(false);
             if target_is_behind {
                 // Fast-forward possible, no conflict
-            } else if let Some(ref _patch) = body.patch {
-                // With a patch, we can't auto-detect conflicts
             } else {
-                // Real divergence — potential conflicts
-                let target_oid = repo.resolve_ref(target).ok().unwrap_or_default();
-                let head_oid = repo
-                    .resolve_ref(&default_branch)
-                    .ok()
-                    .unwrap_or_default();
-
-                if !target_oid.is_empty() && !head_oid.is_empty() {
-                    let diff = repo
-                        .diff(Some(&format!("{base_oid}")), Some(&target_oid))
-                        .unwrap_or_default();
-                    if !diff.is_empty() {
-                        conflicts.push(json!({
-                            "filename": "<merge>",
-                            "reason": format!("diverged: {target} and {default_branch} have both changed")
-                        }));
-                    }
-                }
+                // Branches have diverged. Without a full 3-way merge in a
+                // worktree (which vlecht doesn't implement yet), we can't
+                // determine file-level conflicts. Report the divergence as
+                // a conflict so the client knows a real merge is needed.
+                conflicts.push(json!({
+                    "filename": "*",
+                    "reason": format!(
+                        "branches {default_branch} and {target} have diverged; "
+                    )
+                }));
             }
         }
     }

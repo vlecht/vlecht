@@ -41,19 +41,7 @@ pub async fn handler(
 
     // Readme support: if a README candidate exists, include its contents
     // (so the appview can render it client-side without a second round-trip).
-    let mut readme_name = String::new();
-    let mut readme_contents = String::new();
-    for e in &entries {
-        if is_readme(&e.name) && e.kind == EntryKindSnapshot::Blob {
-            if let Ok(bytes) = repo.blob(&ref_name, &join(tree_path.unwrap_or(""), &e.name)) {
-                if let Ok(s) = std::str::from_utf8(&bytes) {
-                    readme_name = e.name.clone();
-                    readme_contents = s.to_string();
-                    break;
-                }
-            }
-        }
-    }
+    let readme_name = readme_filename(&entries);
 
     let files: Vec<Value> = entries
         .into_iter()
@@ -62,15 +50,43 @@ pub async fn handler(
                 EntryKindSnapshot::Tree => "tree",
                 EntryKindSnapshot::Blob => "blob",
             };
-            json!({
+            let full_path = match tree_path {
+                Some(prefix) => format!("{}/{}", prefix.trim_end_matches('/'), e.name),
+                None => e.name.clone(),
+            };
+            let mut file_entry = json!({
                 "name": e.name,
                 "mode": e.mode,
                 "size": e.size,
                 "kind": kind,
                 "sha": e.sha,
-            })
+            });
+            // Add lastCommit per file
+            if let Ok(sha) = repo.last_commit_for_path(&ref_name, &full_path) {
+                if let Ok(commits) = repo.commits(&sha, 0, 1) {
+                    if let Some(c) = commits.first() {
+                        file_entry["last_commit"] = json!({
+                            "hash": c.sha,
+                            "message": c.message,
+                            "when": c.date,
+                            "author": {
+                                "name": c.author,
+                                "email": "",
+                                "when": c.date,
+                            },
+                        });
+                    }
+                }
+            }
+            file_entry
         })
         .collect();
+
+        let last_commit = files
+            .iter()
+            .filter_map(|f| f.get("last_commit"))
+            .max_by_key(|lc| lc["when"].as_str().unwrap_or("").to_string());
+        let last_commit = last_commit.map(Clone::clone);
 
     let parent = tree_path.map(|s| s.to_string());
     let dotdot = tree_path.and_then(|s| {
@@ -78,21 +94,53 @@ pub async fn handler(
         p.parent().and_then(|p| p.to_str()).map(|s| s.to_string())
     });
 
-    Ok(Json(json!({
+    let mut body = json!({
         "ref": ref_name,
         "parent": parent,
         "dotdot": dotdot,
         "files": files,
-        "readme": {
-            "filename": readme_name,
-            "contents": readme_contents,
-        },
-    })))
+    });
+
+    if !readme_name.is_empty() {
+        if let Ok(bytes) = repo.blob(&ref_name, &join(tree_path.unwrap_or(""), &readme_name)) {
+            if let Ok(s) = std::str::from_utf8(&bytes) {
+                body["readme"] = json!({
+                    "filename": readme_name,
+                    "contents": s,
+                });
+            }
+        }
+    }
+
+    if let Some(lc) = last_commit {
+        body["lastCommit"] = lc;
+    }
+
+    Ok(Json(body))
 }
 
-fn is_readme(name: &str) -> bool {
-    let lower = name.to_ascii_lowercase();
-    matches!(lower.as_str(), "readme" | "readme.md" | "readme.txt")
+/// README file detection matching Go knotserver's `Server.Readme` config.
+/// Checks file name (case-insensitive) and mode (must be a blob).
+fn readme_filename(entries: &[vlecht_git::TreeEntry]) -> String {
+    let candidates = [
+        "README.md", "readme.md",
+        "README", "readme",
+        "README.markdown", "readme.markdown",
+        "README.txt", "readme.txt",
+        "README.rst", "readme.rst",
+        "README.org", "readme.org",
+        "README.asciidoc", "readme.asciidoc",
+    ];
+    for entry in entries {
+        if entry.kind == EntryKindSnapshot::Blob {
+            for &cand in &candidates {
+                if entry.name == cand {
+                    return entry.name.clone();
+                }
+            }
+        }
+    }
+    String::new()
 }
 
 fn join(a: &str, b: &str) -> String {

@@ -10,7 +10,7 @@ use serde::Deserialize;
 
 /// `sh.tangled.repo.archive` — return a tarball/zip of the repo at a ref.
 ///
-/// Query params: `repo`, `ref`, `format` (`tar.gz` or `zip`, default `tar.gz`).
+/// Query params: `repo`, `ref`, `format` (`tar.gz` or `zip`, default `tar.gz`), `prefix`.
 /// Returns the raw archive bytes; `*/*` encoding per the lexicon.
 #[derive(Deserialize)]
 pub struct Params {
@@ -18,6 +18,8 @@ pub struct Params {
     pub r#ref: String,
     #[serde(default = "default_format")]
     pub format: String,
+    #[serde(default)]
+    pub prefix: Option<String>,
 }
 
 fn default_format() -> String {
@@ -41,12 +43,30 @@ pub async fn handler(
         }
     };
 
+    let repo_name = p.repo.rsplit('/').next().unwrap_or("repo");
+    // Safe filename: replace / with - in ref name
+    let safe_ref = p.r#ref.replace('/', "-");
+    let default_prefix = format!("{repo_name}-{safe_ref}");
+    let prefix = p.prefix.as_deref().unwrap_or(&default_prefix);
+
     let bytes = repo
-        .archive(&p.r#ref, format, "repo/")
+        .archive(&p.r#ref, format, prefix)
         .map_err(|e| XrpcError::InternalServerError(e.to_string()))?;
 
-    let repo_name = p.repo.rsplit('/').next().unwrap_or("repo");
-    let filename = format!("{}-{}.{}", repo_name, p.r#ref, p.format);
+    let fmt_ext = match format {
+        ArchiveFormat::TarGz => "tar.gz",
+        ArchiveFormat::Zip => "zip",
+    };
+    let filename = format!("{repo_name}-{safe_ref}.{fmt_ext}");
+
+    // Immutable Link header for caching
+    let immutable_link = format!(
+        "/xrpc/sh.tangled.repo.archive?repo={repo_enc}&ref={ref_enc}&format={fmt_enc}&prefix={prefix_enc}",
+        repo_enc = urlencoding(&p.repo),
+        ref_enc = urlencoding(&p.r#ref),
+        fmt_enc = urlencoding(fmt_ext),
+        prefix_enc = urlencoding(prefix),
+    );
 
     Ok(Response::builder()
         .status(StatusCode::OK)
@@ -55,6 +75,12 @@ pub async fn handler(
             header::CONTENT_DISPOSITION,
             format!("attachment; filename=\"{}\"", filename),
         )
+        .header(header::LINK, format!("<{}>; rel=\"immutable\"", immutable_link))
         .body(Body::from(bytes))
         .unwrap())
+}
+
+fn urlencoding(s: &str) -> String {
+    let bytes = urlencoding::encode(s);
+    bytes.into_owned()
 }
