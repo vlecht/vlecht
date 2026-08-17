@@ -1,5 +1,25 @@
 use std::path::PathBuf;
 
+/// Default location for the SSH host key: a per-user state dir, not the
+/// working directory, so it never ends up inside the source checkout.
+/// Falls back to the working directory only if no home/state dir exists.
+fn default_ssh_host_key_path() -> PathBuf {
+    let base = std::env::var("XDG_STATE_HOME")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var("HOME")
+                .ok()
+                .filter(|v| !v.is_empty())
+                .map(|h| PathBuf::from(h).join(".local/state"))
+        });
+    match base {
+        Some(dir) => dir.join("vlecht").join("ssh-host-key"),
+        None => PathBuf::from("./vlecht-ssh-host-key"),
+    }
+}
+
 pub struct AuthConfig {
     pub did_header: String,
 }
@@ -44,7 +64,7 @@ impl Config {
                 .unwrap_or(2222),
             ssh_host_key_path: std::env::var("VLECHT_SSH_HOST_KEY_PATH")
                 .map(PathBuf::from)
-                .unwrap_or_else(|_| PathBuf::from("./vlecht-ssh-host-key")),
+                .unwrap_or_else(|_| default_ssh_host_key_path()),
             auth: AuthConfig { did_header },
         })
     }

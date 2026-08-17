@@ -569,7 +569,9 @@ async fn resolve_repo_path(state: &AppState, owner: &str, repo: &str) -> Option<
         return None;
     }
     let root = &state.cfg.repo_scan_path;
-    if let Ok(alias) = state.db.find_repo_alias(owner, repo).await {
+    // Aliases are stored with full DIDs; SSH paths carry the short owner name.
+    let owner_did = format!("did:plc:{owner}");
+    if let Ok(alias) = state.db.find_repo_alias(&owner_did, repo).await {
         if is_safe_segment(&alias.repo_did) {
             let candidate = root.join(&alias.repo_did);
             if let Some(canon) = resolve_within_root(root, &candidate) {
