@@ -11,10 +11,10 @@ chrono = "0.4"
 tar = "0.4"
 flate2 = "1"
 zip = { version = "2", default-features = false, features = ["deflate"] }
-gix = { version = "0.84", default-features = false, features = ["basic", "blob-diff", "revision"] }
-gix-hash = { version = "0.25", default-features = false }
-gix-object = { version = "0.61", default-features = false }
-gix-ref = { version = "0.64", default-features = false }
-gix-pack = { version = "0.71", default-features = false, features = ["streaming-input", "generate"] }
-gix-features = { version = "0.48", default-features = false }
-miniz_oxide = "0.8"
+gix = { version = "0.87", default-features = false, features = ["basic", "blob-diff", "revision", "sha1"] }
+gix-object = { version = "0.64", default-features = false }
+gix-ref = { version = "0.67", default-features = false }
+gix-pack = { version = "0.74", default-features = false, features = ["streaming-input", "generate"] }
+gix-features = { version = "0.49", default-features = false }
+gix-zlib = "0.1"
+miniz_oxide = "0.9"

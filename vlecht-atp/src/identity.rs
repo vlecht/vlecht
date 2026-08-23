@@ -1,6 +1,6 @@
 use crate::config::AtpConfig;
 use jacquard_identity::resolver::ResolverOptions;
-use jacquard_identity::JacquardResolver;
+use jacquard_identity::{JacquardResolver, PublicResolver};
 use std::sync::Arc;
 
 /// The shared identity resolver used for DID/handle lookups.
@@ -9,7 +9,7 @@ use std::sync::Arc;
 /// we hold it directly in shared state.
 #[derive(Clone)]
 pub struct AtpIdentity {
-    pub resolver: Arc<JacquardResolver>,
+    pub resolver: Arc<PublicResolver>,
 }
 
 impl AtpIdentity {

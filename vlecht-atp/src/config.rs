@@ -52,7 +52,9 @@ impl AtpConfig {
     /// `verificationMethod` entry. Returns `None` if ATproto is not
     /// enabled (missing audience DID or key file).
     pub fn build_did_document(&self) -> Option<
-        jacquard_common::types::did_doc::DidDocument<'static>,
+        jacquard_common::types::did_doc::DidDocument<
+            jacquard_common::CowStr<'static>,
+        >,
     > {
         use jacquard_common::types::did_doc::{DidDocument, VerificationMethod};
         use jacquard_common::CowStr;

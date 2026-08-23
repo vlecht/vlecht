@@ -2,7 +2,7 @@ use crate::AppState;
 use vlecht_db::RepoStore;
 use vlecht_git::GitRepo;
 use russh::keys::ssh_key::PublicKey;
-use russh::server::{Msg, Server as _, Session};
+use russh::server::{ChannelOpenHandle, Msg, Server as _, Session};
 use russh::{Channel, ChannelId, ChannelStream};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -144,10 +144,12 @@ impl russh::server::Handler for GitSession {
     async fn channel_open_session(
         &mut self,
         channel: Channel<Msg>,
+        reply: ChannelOpenHandle,
         _session: &mut Session,
-    ) -> Result<bool, Self::Error> {
+    ) -> Result<(), Self::Error> {
         self.channels.lock().await.insert(channel.id(), channel);
-        Ok(true)
+        reply.accept().await;
+        Ok(())
     }
 
     async fn exec_request(

@@ -18,9 +18,9 @@ hex = "0.4"
 urlencoding = "2"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 
-jacquard-axum = "0.11"
-jacquard-identity = "0.11"
-jacquard-common = { version = "0.11", features = ["crypto-k256", "service-auth"] }
+jacquard-axum = "0.12"
+jacquard-identity = "0.12"
+jacquard-common = { version = "0.12", features = ["crypto-k256", "service-auth"] }
 vlecht-db = { path = "../vlecht-db" }
 vlecht-git = { path = "../vlecht-git" }
 

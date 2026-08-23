@@ -8,6 +8,6 @@ tokio.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
-sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite", "migrate"] }
+sqlx = { version = "0.9", features = ["runtime-tokio", "sqlite", "migrate"] }
 async-trait = "0.1"
 chrono = { version = "0.4", features = ["serde"] }

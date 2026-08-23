@@ -17,6 +17,3 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 thiserror = "2"
 clap = { version = "4", features = ["derive"] }
 
-
-[patch.crates-io]
-gix-hash = { path = "gix-hash-patched" }

@@ -20,7 +20,7 @@ pub struct AppState {
     /// Service auth config for XRPC write endpoints. None when ATproto is
     /// disabled (write endpoints return 401).
     pub atp_service_auth:
-        Arc<Option<vlecht_atp::ServiceAuthConfig<vlecht_atp::JacquardResolver>>>,
+        Arc<Option<vlecht_atp::ServiceAuthConfig<vlecht_atp::PublicResolver>>>,
 }
 
 /// Build the application router with all routes and state.

@@ -577,7 +577,7 @@ impl GitRepo {
                 None
             } else {
                 Some(
-                    gix_hash::ObjectId::from_hex(cmd.old_sha.as_bytes())
+                    gix::hash::ObjectId::from_hex(cmd.old_sha.as_bytes())
                         .map_err(|e| GitError::Protocol(format!("invalid old sha: {e}")))?,
                 )
             };
@@ -585,7 +585,7 @@ impl GitRepo {
                 None
             } else {
                 Some(
-                    gix_hash::ObjectId::from_hex(cmd.new_sha.as_bytes())
+                    gix::hash::ObjectId::from_hex(cmd.new_sha.as_bytes())
                         .map_err(|e| GitError::Protocol(format!("invalid new sha: {e}")))?,
                 )
             };
@@ -660,11 +660,11 @@ impl GitRepo {
             &mut gix_features::progress::Discard,
             &std::sync::atomic::AtomicBool::new(false),
             Some(&self.inner),
+            self.inner.object_hash(),
             gix_pack::bundle::write::Options {
                 iteration_mode: gix_pack::data::input::Mode::Verify,
-                index_version: gix_pack::index::Version::default(),
-                object_hash: self.inner.object_hash(),
                 thread_limit: None,
+                ..Default::default()
             },
         )
         .map_err(|e| GitError::Gix(format!("pack write: {e}")))?;
@@ -682,7 +682,11 @@ impl GitRepo {
 
         // Resolve ref-deltas again since we need the resolved objects
         let resolve_iter2 =
-            gix_pack::data::input::LookupRefDeltaObjectsIter::new(pack_iter2, &self.inner);
+            gix_pack::data::input::LookupRefDeltaObjectsIter::new(
+                pack_iter2,
+                &self.inner,
+                gix_zlib::Compression::default(),
+            );
 
         for entry_result in resolve_iter2 {
             let entry = entry_result.map_err(|e| GitError::Gix(format!("entry: {e}")))?;
@@ -707,8 +711,8 @@ impl GitRepo {
     fn update_ref(
         &self,
         refname: &str,
-        old: Option<gix_hash::ObjectId>,
-        new: gix_hash::ObjectId,
+        old: Option<gix::hash::ObjectId>,
+        new: gix::hash::ObjectId,
     ) -> Result<(), GitError> {
         use gix::refs::transaction::{Change, PreviousValue, RefEdit};
 
@@ -739,7 +743,7 @@ impl GitRepo {
         Ok(())
     }
 
-    fn delete_ref(&self, refname: &str, old: gix_hash::ObjectId) -> Result<(), GitError> {
+    fn delete_ref(&self, refname: &str, old: gix::hash::ObjectId) -> Result<(), GitError> {
         use gix::refs::transaction::{Change, PreviousValue, RefEdit};
 
         let name: gix::refs::FullName = refname
@@ -868,7 +872,7 @@ impl GitRepo {
         use gix::refs::{Category, FullName};
         use gix::refs::transaction::{Change, PreviousValue, RefEdit};
 
-        let target = gix_hash::ObjectId::from_hex(target_commit.as_bytes())
+        let target = gix::hash::ObjectId::from_hex(target_commit.as_bytes())
             .map_err(|e| GitError::Gix(e.to_string()))?;
 
         let full_name: FullName =
@@ -892,7 +896,7 @@ impl GitRepo {
     pub fn set_hidden_ref(&self, name: &str, target_oid: &str) -> Result<(), GitError> {
         use gix::refs::transaction::{Change, PreviousValue, RefEdit};
 
-        let target = gix_hash::ObjectId::from_hex(target_oid.as_bytes())
+        let target = gix::hash::ObjectId::from_hex(target_oid.as_bytes())
             .map_err(|e| GitError::Gix(e.to_string()))?;
 
         let refname = format!("refs/hidden/{name}");
@@ -1241,7 +1245,11 @@ fn generate_pack_bytes(
             id: *oid,
             entry_pack_location: gix_pack::data::output::count::PackLocation::NotLookedUp,
         };
-        let entry = gix_pack::data::output::Entry::from_data(&count, &data)
+        let entry = gix_pack::data::output::Entry::from_data(
+            &count,
+            &data,
+            gix_zlib::Compression::default(),
+        )
             .map_err(|e| GitError::Gix(format!("pack entry: {e}")))?;
         entries.push(entry);
     }

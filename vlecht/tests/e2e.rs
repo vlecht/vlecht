@@ -386,7 +386,7 @@ async fn e2e_git_push_two_commits() {
 async fn e2e_git_ls_remote() {
     let port = unique_port();
     let server = ServerHandle::start(port, None).await;
-    let repo_path = server.init_repo("alice", "lsremote").await;
+    server.init_repo("alice", "lsremote").await;
     let wd = server.workdir("ls_work");
     let local = wd.join("src");
     std::fs::create_dir_all(&local).unwrap();
@@ -488,7 +488,7 @@ async fn e2e_git_push_delete_branch() {
 async fn e2e_git_pull_after_push() {
     let port = unique_port();
     let server = ServerHandle::start(port, None).await;
-    let repo_path = server.init_repo("alice", "pulltest").await;
+    server.init_repo("alice", "pulltest").await;
     let wd = server.workdir("pull_work");
 
     let local = wd.join("local");
@@ -525,7 +525,7 @@ async fn e2e_git_pull_after_push() {
 async fn e2e_browse_api() {
     let port = unique_port();
     let server = ServerHandle::start(port, None).await;
-    let repo_path = server.init_repo("alice", "browse").await;
+    server.init_repo("alice", "browse").await;
     let wd = server.workdir("browse_work");
     let local = wd.join("src");
     std::fs::create_dir_all(&local).unwrap();

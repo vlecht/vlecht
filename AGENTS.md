@@ -17,8 +17,11 @@ vlecht/        # binary + library. CLI, config, axum server, handlers, routing, 
 vlecht-git/    # pure gix git operations. No `git` binary anywhere.
 vlecht-db/     # sqlx-based data access. SQLite now, Postgres/MySQL later.
 vlecht-atp/    # AT Protocol integration: XRPC endpoints, identity, service auth, did:web
-gix-hash-patched/  # patched gix-hash with extra derives (workspace patch override)
 ```
+
+Note: published `gix-hash` declares `default = []` and does not compile at all
+without a hash feature, so `gix` must be pulled in with its `sha1` feature
+enabled explicitly (we use `default-features = false`). See `vlecht-git/Cargo.toml`.
 
 **`vlecht` is a lib+bin hybrid** (`src/lib.rs` + `src/main.rs`). The lib re-exports `build_app()` so integration tests can spawn the router in-process. Don't merge them.
 

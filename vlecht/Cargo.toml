@@ -20,8 +20,8 @@ vlecht-db = { path = "../vlecht-db" }
 vlecht-git = { path = "../vlecht-git" }
 vlecht-atp = { path = "../vlecht-atp" }
 flate2 = "1"
-jacquard-identity = "0.11"
-russh = { version = "0.61.1", default-features = false, features = ["aws-lc-rs"] }
+jacquard-identity = "0.12"
+russh = { version = "0.63", default-features = false, features = ["aws-lc-rs"] }
 rand = "0.10.1"
 
 [dev-dependencies]

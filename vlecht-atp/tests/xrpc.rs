@@ -1024,7 +1024,7 @@ const TEST_AUDIENCE_DID: &str = "did:web:test.knot";
 /// Used so service-auth token validation succeeds without network access.
 #[derive(Clone)]
 struct MockResolver {
-    did_doc: jacquard_common::types::did_doc::DidDocument<'static>,
+    did_doc: jacquard_common::types::did_doc::DidDocument,
 }
 
 impl jacquard_identity::resolver::IdentityResolver for MockResolver {
@@ -1034,20 +1034,20 @@ impl jacquard_identity::resolver::IdentityResolver for MockResolver {
         OPTS.get_or_init(Default::default)
     }
 
-    fn resolve_handle(
+    fn resolve_handle<S: jacquard_common::BosStr + Sync>(
         &self,
-        _handle: &jacquard_common::types::string::Handle<'_>,
+        _handle: &jacquard_common::types::string::Handle<S>,
     ) -> impl std::future::Future<
-        Output = Result<jacquard_common::types::string::Did<'static>, jacquard_identity::resolver::IdentityError>,
+        Output = Result<jacquard_common::types::string::Did, jacquard_identity::resolver::IdentityError>,
     > + Send {
         async {
             Err(jacquard_identity::resolver::IdentityError::handle_resolution_exhausted())
         }
     }
 
-    fn resolve_did_doc(
+    fn resolve_did_doc<S: jacquard_common::BosStr + Sync>(
         &self,
-        _did: &jacquard_common::types::string::Did<'_>,
+        _did: &jacquard_common::types::string::Did<S>,
     ) -> impl std::future::Future<
         Output = Result<jacquard_identity::resolver::DidDocResponse, jacquard_identity::resolver::IdentityError>,
     > + Send {
@@ -1067,8 +1067,7 @@ impl jacquard_identity::resolver::IdentityResolver for MockResolver {
 fn build_did_doc(
     issuer_did: &str,
     verifying_key: &k256::ecdsa::VerifyingKey,
-) -> jacquard_common::types::did_doc::DidDocument<'static> {
-    use jacquard_common::CowStr;
+) -> jacquard_common::types::did_doc::DidDocument {
     use jacquard_common::types::did_doc::{DidDocument, VerificationMethod};
 
     let pt = verifying_key.to_encoded_point(true);
@@ -1081,10 +1080,10 @@ fn build_did_doc(
         id: jacquard_common::types::string::Did::new_owned(issuer_did).unwrap(),
         also_known_as: None,
         verification_method: Some(vec![VerificationMethod {
-            id: CowStr::copy_from_str(&format!("{issuer_did}#atproto")),
-            r#type: CowStr::new_static("Multikey"),
-            controller: Some(CowStr::copy_from_str(issuer_did)),
-            public_key_multibase: Some(CowStr::copy_from_str(&pk_multibase)),
+            id: jacquard_common::deps::smol_str::SmolStr::new(format!("{issuer_did}#atproto")),
+            r#type: jacquard_common::deps::smol_str::SmolStr::new_static("Multikey"),
+            controller: Some(jacquard_common::deps::smol_str::SmolStr::new(issuer_did)),
+            public_key_multibase: Some(jacquard_common::deps::smol_str::SmolStr::new(pk_multibase)),
             extra_data: Default::default(),
         }]),
         service: None,
@@ -1161,7 +1160,8 @@ impl AuthServer {
         let sa_cfg = Some(jacquard_axum::service_auth::ServiceAuthConfig::new(
             audience,
             resolver,
-        ));
+        )
+        .disable_replay_protection());
 
         let lex_state = vlecht_atp::lex::LexState {
             db: db.clone(),
@@ -1228,19 +1228,6 @@ impl AuthServer {
         let body: serde_json::Value = resp.json().await.unwrap_or_default();
         (status, body)
     }
-}
-
-async fn post_json(server: &ServerHandle, path: &str, body: &serde_json::Value) -> (u16, serde_json::Value) {
-    let client = reqwest::Client::new();
-    let resp = client
-        .post(server.url(path))
-        .json(body)
-        .send()
-        .await
-        .unwrap();
-    let status = resp.status().as_u16();
-    let body: serde_json::Value = resp.json().await.unwrap_or_default();
-    (status, body)
 }
 
 #[tokio::test(flavor = "multi_thread")]

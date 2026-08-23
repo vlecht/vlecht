@@ -49,7 +49,7 @@ pub async fn handler(
     // of head (already up to date) or there's a real merge needed.
     let mut conflicts: Vec<Value> = Vec::new();
 
-    if let Some(ref base_oid) = merge_base {
+    if merge_base.is_some() {
         let head_is_ancestor = repo
             .is_ancestor(target, &default_branch)
             .unwrap_or(false);
