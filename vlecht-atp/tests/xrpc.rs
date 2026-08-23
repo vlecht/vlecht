@@ -95,7 +95,11 @@ impl ServerHandle {
             axum::serve(listener, app).await.unwrap();
         });
         wait_for_port(port).await;
-        ServerHandle { tmpdir, port, db: db_handle }
+        ServerHandle {
+            tmpdir,
+            port,
+            db: db_handle,
+        }
     }
 
     fn url(&self, path: &str) -> String {
@@ -786,7 +790,10 @@ async fn xrpc_languages_returns_language_stats() {
     assert!(body["languages"].is_array());
     // seed_repo creates README.md and src/lib.rs — Rust should be detected.
     let langs = body["languages"].as_array().unwrap();
-    assert!(!langs.is_empty(), "expected non-empty languages, got {body}");
+    assert!(
+        !langs.is_empty(),
+        "expected non-empty languages, got {body}"
+    );
     assert!(
         langs.iter().any(|l| l["name"] == "Rust"),
         "expected Rust in languages, got {body}"
@@ -896,7 +903,11 @@ async fn start_server_with_did(tmpdir: PathBuf, port: u16) -> ServerHandle {
         axum::serve(listener, app).await.unwrap();
     });
     wait_for_port(port).await;
-    ServerHandle { tmpdir, port, db: db_handle }
+    ServerHandle {
+        tmpdir,
+        port,
+        db: db_handle,
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -928,11 +939,10 @@ async fn did_web_document_served_with_correct_shape() {
     let body: serde_json::Value = resp.json().await.unwrap();
 
     // @context
-    let ctx = body["@context"].as_array().expect("@context should be an array");
-    assert!(
-        !ctx.is_empty(),
-        "@context should not be empty"
-    );
+    let ctx = body["@context"]
+        .as_array()
+        .expect("@context should be an array");
+    assert!(!ctx.is_empty(), "@context should not be empty");
 
     // id matches audience DID
     assert_eq!(body["id"], "did:web:test.knot.example.com");
@@ -944,15 +954,9 @@ async fn did_web_document_served_with_correct_shape() {
     assert_eq!(vm.len(), 1, "expected exactly one verification method");
 
     let method = &vm[0];
-    assert_eq!(
-        method["id"],
-        "did:web:test.knot.example.com#atproto"
-    );
+    assert_eq!(method["id"], "did:web:test.knot.example.com#atproto");
     assert_eq!(method["type"], "Multikey");
-    assert_eq!(
-        method["controller"],
-        "did:web:test.knot.example.com"
-    );
+    assert_eq!(method["controller"], "did:web:test.knot.example.com");
     assert!(method["publicKeyMultibase"].is_string());
     assert!(
         method["publicKeyMultibase"]
@@ -1019,12 +1023,14 @@ async fn did_web_document_returns_404_when_atproto_disabled() {
 const TEST_ISSUER_DID: &str = "did:plc:testowner";
 /// The audience DID — the knot's own identity.
 const TEST_AUDIENCE_DID: &str = "did:web:test.knot";
+/// A second identity used as space member / non-owner in tests.
+const TEST_MEMBER_DID: &str = "did:plc:testmember";
 
 /// A mock identity resolver that returns a fixed DID document for any DID.
 /// Used so service-auth token validation succeeds without network access.
 #[derive(Clone)]
 struct MockResolver {
-    did_doc: jacquard_common::types::did_doc::DidDocument,
+    did_docs: std::collections::HashMap<String, jacquard_common::types::did_doc::DidDocument>,
 }
 
 impl jacquard_identity::resolver::IdentityResolver for MockResolver {
@@ -1038,21 +1044,30 @@ impl jacquard_identity::resolver::IdentityResolver for MockResolver {
         &self,
         _handle: &jacquard_common::types::string::Handle<S>,
     ) -> impl std::future::Future<
-        Output = Result<jacquard_common::types::string::Did, jacquard_identity::resolver::IdentityError>,
+        Output = Result<
+            jacquard_common::types::string::Did,
+            jacquard_identity::resolver::IdentityError,
+        >,
     > + Send {
-        async {
-            Err(jacquard_identity::resolver::IdentityError::handle_resolution_exhausted())
-        }
+        async { Err(jacquard_identity::resolver::IdentityError::handle_resolution_exhausted()) }
     }
 
     fn resolve_did_doc<S: jacquard_common::BosStr + Sync>(
         &self,
-        _did: &jacquard_common::types::string::Did<S>,
+        did: &jacquard_common::types::did::Did<S>,
     ) -> impl std::future::Future<
-        Output = Result<jacquard_identity::resolver::DidDocResponse, jacquard_identity::resolver::IdentityError>,
+        Output = Result<
+            jacquard_identity::resolver::DidDocResponse,
+            jacquard_identity::resolver::IdentityError,
+        >,
     > + Send {
-        let doc = self.did_doc.clone();
+        let doc = self.did_docs.get(did.as_str()).cloned();
         async move {
+            let Some(doc) = doc else {
+                return Err(
+                    jacquard_identity::resolver::IdentityError::handle_resolution_exhausted(),
+                );
+            };
             let json = serde_json::to_vec(&doc).unwrap();
             Ok(jacquard_identity::resolver::DidDocResponse {
                 buffer: bytes::Bytes::from(json),
@@ -1125,6 +1140,7 @@ fn mint_service_auth_jwt(
 struct AuthServer {
     handle: ServerHandle,
     signing_key: k256::ecdsa::SigningKey,
+    member_signing_key: k256::ecdsa::SigningKey,
 }
 
 impl std::ops::Deref for AuthServer {
@@ -1148,26 +1164,34 @@ impl AuthServer {
         let db = vlecht_db::Db::open(&db_path).await.unwrap();
         db.migrate().await.unwrap();
 
-        // Generate a k256 keypair for signing service-auth tokens.
+        // Generate k256 keypairs for signing service-auth tokens.
         let signing_key =
             k256::ecdsa::SigningKey::random(&mut k256::elliptic_curve::rand_core::OsRng);
-        let verifying_key = signing_key.verifying_key();
+        let member_signing_key =
+            k256::ecdsa::SigningKey::random(&mut k256::elliptic_curve::rand_core::OsRng);
 
-        let did_doc = build_did_doc(TEST_ISSUER_DID, verifying_key);
-        let resolver = MockResolver { did_doc };
-        let audience =
-            jacquard_common::types::string::Did::new_owned(TEST_AUDIENCE_DID).unwrap();
-        let sa_cfg = Some(jacquard_axum::service_auth::ServiceAuthConfig::new(
-            audience,
-            resolver,
-        )
-        .disable_replay_protection());
+        let mut did_docs = std::collections::HashMap::new();
+        did_docs.insert(
+            TEST_ISSUER_DID.to_string(),
+            build_did_doc(TEST_ISSUER_DID, signing_key.verifying_key()),
+        );
+        did_docs.insert(
+            TEST_MEMBER_DID.to_string(),
+            build_did_doc(TEST_MEMBER_DID, member_signing_key.verifying_key()),
+        );
+        let resolver = MockResolver { did_docs };
+        let audience = jacquard_common::types::string::Did::new_owned(TEST_AUDIENCE_DID).unwrap();
+        let sa_cfg = Some(
+            jacquard_axum::service_auth::ServiceAuthConfig::new(audience, resolver)
+                .disable_replay_protection(),
+        );
 
         let lex_state = vlecht_atp::lex::LexState {
             db: db.clone(),
             version: "test".to_string(),
             owner_did: TEST_ISSUER_DID.to_string(),
             repo_scan_path: repo_scan,
+            audience_did: TEST_AUDIENCE_DID.to_string(),
         };
 
         let xrpc_router = vlecht_atp::lex::router(lex_state, sa_cfg);
@@ -1182,22 +1206,14 @@ impl AuthServer {
         AuthServer {
             handle: ServerHandle { tmpdir, port, db },
             signing_key,
+            member_signing_key,
         }
     }
 
     /// Mint a JWT for the given endpoint NSID and send an authed POST.
-    async fn post(
-        &self,
-        path: &str,
-        body: &serde_json::Value,
-    ) -> (u16, serde_json::Value) {
+    async fn post(&self, path: &str, body: &serde_json::Value) -> (u16, serde_json::Value) {
         let lxm = path.trim_start_matches("/xrpc/");
-        let jwt = mint_service_auth_jwt(
-            TEST_ISSUER_DID,
-            TEST_AUDIENCE_DID,
-            lxm,
-            &self.signing_key,
-        );
+        let jwt = mint_service_auth_jwt(TEST_ISSUER_DID, TEST_AUDIENCE_DID, lxm, &self.signing_key);
         let client = reqwest::Client::new();
         let resp = client
             .post(self.handle.url(path))
@@ -1228,25 +1244,87 @@ impl AuthServer {
         let body: serde_json::Value = resp.json().await.unwrap_or_default();
         (status, body)
     }
+
+    /// GET with a freshly-minted service-auth JWT for `iss`.
+    async fn get_as(
+        &self,
+        path: &str,
+        iss: &str,
+        key: &k256::ecdsa::SigningKey,
+    ) -> (u16, serde_json::Value) {
+        let lxm = path.split('?').next().unwrap().trim_start_matches("/xrpc/");
+        let jwt = mint_service_auth_jwt(iss, TEST_AUDIENCE_DID, lxm, key);
+        let client = reqwest::Client::new();
+        let resp = client
+            .get(self.handle.url(path))
+            .header("Authorization", format!("Bearer {jwt}"))
+            .send()
+            .await
+            .unwrap();
+        let status = resp.status().as_u16();
+        let body: serde_json::Value = resp.json().await.unwrap_or_default();
+        (status, body)
+    }
+
+    /// GET as the member identity.
+    async fn get_member(&self, path: &str) -> (u16, serde_json::Value) {
+        self.get_as(path, TEST_MEMBER_DID, &self.member_signing_key)
+            .await
+    }
+
+    /// GET as the owner identity.
+    async fn get_owner(&self, path: &str) -> (u16, serde_json::Value) {
+        self.get_as(path, TEST_ISSUER_DID, &self.signing_key).await
+    }
+
+    /// POST as the member identity.
+    async fn post_member(&self, path: &str, body: &serde_json::Value) -> (u16, serde_json::Value) {
+        let lxm = path.trim_start_matches("/xrpc/");
+        let jwt = mint_service_auth_jwt(
+            TEST_MEMBER_DID,
+            TEST_AUDIENCE_DID,
+            lxm,
+            &self.member_signing_key,
+        );
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(self.handle.url(path))
+            .header("Authorization", format!("Bearer {jwt}"))
+            .json(body)
+            .send()
+            .await
+            .unwrap();
+        let status = resp.status().as_u16();
+        let body: serde_json::Value = resp.json().await.unwrap_or_default();
+        (status, body)
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn xrpc_write_create_repo() {
     let server = AuthServer::start().await;
 
-    let (status, body) = server.post(
-        "/xrpc/sh.tangled.repo.create",
-        &serde_json::json!({"name": "my-repo", "rkey": "my-repo"}),
-    )
-    .await;
+    let (status, body) = server
+        .post(
+            "/xrpc/sh.tangled.repo.create",
+            &serde_json::json!({"name": "my-repo", "rkey": "my-repo"}),
+        )
+        .await;
     assert_eq!(status, 200, "body={body}");
     assert!(body["repoDid"].is_string(), "expected repoDid, got {body}");
     let repo_did = body["repoDid"].as_str().unwrap();
     assert!(repo_did.starts_with("did:plc:"));
 
     // Repo should exist on disk
-    let repo_path = server.tmpdir.join("repos").join("did:plc:testowner").join("my-repo");
-    assert!(repo_path.exists(), "repo not created on disk at {repo_path:?}");
+    let repo_path = server
+        .tmpdir
+        .join("repos")
+        .join("did:plc:testowner")
+        .join("my-repo");
+    assert!(
+        repo_path.exists(),
+        "repo not created on disk at {repo_path:?}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1254,18 +1332,20 @@ async fn xrpc_write_create_repo_already_exists() {
     let server = AuthServer::start().await;
 
     // First create
-    server.post(
-        "/xrpc/sh.tangled.repo.create",
-        &serde_json::json!({"name": "dup-repo", "rkey": "dup-repo"}),
-    )
-    .await;
+    server
+        .post(
+            "/xrpc/sh.tangled.repo.create",
+            &serde_json::json!({"name": "dup-repo", "rkey": "dup-repo"}),
+        )
+        .await;
 
     // Second create should fail
-    let (status, body) = server.post(
-        "/xrpc/sh.tangled.repo.create",
-        &serde_json::json!({"name": "dup-repo", "rkey": "dup-repo"}),
-    )
-    .await;
+    let (status, body) = server
+        .post(
+            "/xrpc/sh.tangled.repo.create",
+            &serde_json::json!({"name": "dup-repo", "rkey": "dup-repo"}),
+        )
+        .await;
     assert_eq!(status, 409, "expected 409 conflict, got {status}: {body}");
     assert_eq!(body["error"], "RepoAlreadyExists");
 }
@@ -1274,11 +1354,12 @@ async fn xrpc_write_create_repo_already_exists() {
 async fn xrpc_write_create_repo_invalid_name() {
     let server = AuthServer::start().await;
 
-    let (status, body) = server.post(
-        "/xrpc/sh.tangled.repo.create",
-        &serde_json::json!({"name": "bad/name", "rkey": "bad-name"}),
-    )
-    .await;
+    let (status, body) = server
+        .post(
+            "/xrpc/sh.tangled.repo.create",
+            &serde_json::json!({"name": "bad/name", "rkey": "bad-name"}),
+        )
+        .await;
     assert_eq!(status, 400);
     assert_eq!(body["error"], "InvalidRequest");
 }
@@ -1288,20 +1369,22 @@ async fn xrpc_write_delete_repo() {
     let server = AuthServer::start().await;
 
     // Create a repo first
-    server.post(
-        "/xrpc/sh.tangled.repo.create",
-        &serde_json::json!({"name": "to-delete", "rkey": "to-delete"}),
-    )
-    .await;
+    server
+        .post(
+            "/xrpc/sh.tangled.repo.create",
+            &serde_json::json!({"name": "to-delete", "rkey": "to-delete"}),
+        )
+        .await;
 
-    let (status, body) = server.post(
-        "/xrpc/sh.tangled.repo.delete",
-        &serde_json::json!({
-            "did": "did:plc:testowner",
-            "name": "to-delete"
-        }),
-    )
-    .await;
+    let (status, body) = server
+        .post(
+            "/xrpc/sh.tangled.repo.delete",
+            &serde_json::json!({
+                "did": "did:plc:testowner",
+                "name": "to-delete"
+            }),
+        )
+        .await;
     assert_eq!(status, 200, "body={body}");
 
     // Repo should be gone from disk
@@ -1317,14 +1400,15 @@ async fn xrpc_write_delete_repo() {
 async fn xrpc_write_delete_repo_not_found() {
     let server = AuthServer::start().await;
 
-    let (status, body) = server.post(
-        "/xrpc/sh.tangled.repo.delete",
-        &serde_json::json!({
-            "did": "did:plc:testowner",
-            "name": "never-existed"
-        }),
-    )
-    .await;
+    let (status, body) = server
+        .post(
+            "/xrpc/sh.tangled.repo.delete",
+            &serde_json::json!({
+                "did": "did:plc:testowner",
+                "name": "never-existed"
+            }),
+        )
+        .await;
     assert_eq!(status, 404);
     assert_eq!(body["error"], "RepoNotFound");
 }
@@ -1342,14 +1426,15 @@ async fn xrpc_write_set_default_branch() {
     let repo_did = create_body["repoDid"].as_str().unwrap();
 
     // Set default branch to something new
-    let (status, body) = server.post(
-        "/xrpc/sh.tangled.repo.setDefaultBranch",
-        &serde_json::json!({
-            "repo": repo_did,
-            "defaultBranch": "prod"
-        }),
-    )
-    .await;
+    let (status, body) = server
+        .post(
+            "/xrpc/sh.tangled.repo.setDefaultBranch",
+            &serde_json::json!({
+                "repo": repo_did,
+                "defaultBranch": "prod"
+            }),
+        )
+        .await;
     assert_eq!(status, 200, "body={body}");
 
     // Verify with the read endpoint
@@ -1367,11 +1452,12 @@ async fn xrpc_write_delete_branch() {
     let server = AuthServer::start().await;
 
     // Create a repo via API (which creates it on disk with "main" as default)
-    let (_, create_body) = server.post(
-        "/xrpc/sh.tangled.repo.create",
-        &serde_json::json!({"name": "del-branch", "rkey": "del-branch"}),
-    )
-    .await;
+    let (_, create_body) = server
+        .post(
+            "/xrpc/sh.tangled.repo.create",
+            &serde_json::json!({"name": "del-branch", "rkey": "del-branch"}),
+        )
+        .await;
     let _repo_did = create_body["repoDid"].as_str().unwrap();
 
     // Push a second branch via the git CLI
@@ -1395,14 +1481,15 @@ async fn xrpc_write_delete_branch() {
     git(&local, &["push", "origin", "main:feature-x"]);
 
     // Delete the branch
-    let (status, body) = server.post(
-        "/xrpc/sh.tangled.repo.deleteBranch",
-        &serde_json::json!({
-            "repo": format!("did:plc:testowner/del-branch"),
-            "branch": "feature-x"
-        }),
-    )
-    .await;
+    let (status, body) = server
+        .post(
+            "/xrpc/sh.tangled.repo.deleteBranch",
+            &serde_json::json!({
+                "repo": format!("did:plc:testowner/del-branch"),
+                "branch": "feature-x"
+            }),
+        )
+        .await;
     assert_eq!(status, 200, "body={body}");
 
     // Branch should no longer appear
@@ -1425,21 +1512,23 @@ async fn xrpc_write_delete_branch() {
 async fn xrpc_write_delete_branch_cannot_delete_default() {
     let server = AuthServer::start().await;
 
-    let (_, create_body) = server.post(
-        "/xrpc/sh.tangled.repo.create",
-        &serde_json::json!({"name": "nodefdel", "rkey": "nodefdel"}),
-    )
-    .await;
+    let (_, create_body) = server
+        .post(
+            "/xrpc/sh.tangled.repo.create",
+            &serde_json::json!({"name": "nodefdel", "rkey": "nodefdel"}),
+        )
+        .await;
     let repo_did = create_body["repoDid"].as_str().unwrap();
 
-    let (status, body) = server.post(
-        "/xrpc/sh.tangled.repo.deleteBranch",
-        &serde_json::json!({
-            "repo": repo_did,
-            "branch": "main"
-        }),
-    )
-    .await;
+    let (status, body) = server
+        .post(
+            "/xrpc/sh.tangled.repo.deleteBranch",
+            &serde_json::json!({
+                "repo": repo_did,
+                "branch": "main"
+            }),
+        )
+        .await;
     assert_eq!(status, 400, "should reject deleting default branch");
     assert_eq!(body["error"], "InvalidRequest");
 }
@@ -1456,7 +1545,10 @@ async fn xrpc_write_rejects_missing_token() {
             &serde_json::json!({"name": "no-auth-create", "rkey": "no-auth-create"}),
         )
         .await;
-    assert_eq!(status, 401, "expected 401 without auth, got {status}: {body}");
+    assert_eq!(
+        status, 401,
+        "expected 401 without auth, got {status}: {body}"
+    );
     // The service-auth middleware returns its own error tag for missing tokens.
     let err = body["error"].as_str().unwrap_or("");
     assert!(
@@ -1474,11 +1566,12 @@ async fn xrpc_merge_check_fast_forwardable() {
     let server = AuthServer::start().await;
 
     // Create a repo
-    let (_, create_body) = server.post(
-        "/xrpc/sh.tangled.repo.create",
-        &serde_json::json!({"name": "merge-ff", "rkey": "merge-ff"}),
-    )
-    .await;
+    let (_, create_body) = server
+        .post(
+            "/xrpc/sh.tangled.repo.create",
+            &serde_json::json!({"name": "merge-ff", "rkey": "merge-ff"}),
+        )
+        .await;
     let _repo_did = create_body["repoDid"].as_str().unwrap();
 
     // Push some commits
@@ -1494,7 +1587,10 @@ async fn xrpc_merge_check_fast_forwardable() {
     std::fs::write(local.join("f.txt"), "v1\n").unwrap();
     git(&local, &["add", "."]);
     git(&local, &["commit", "-m", "v1"]);
-    git(&local, &["remote", "add", "origin", repo_path.to_str().unwrap()]);
+    git(
+        &local,
+        &["remote", "add", "origin", repo_path.to_str().unwrap()],
+    );
     git(&local, &["push", "origin", "main"]);
     git(&local, &["checkout", "-b", "feature"]);
     std::fs::write(local.join("f.txt"), "v2\n").unwrap();
@@ -1503,15 +1599,16 @@ async fn xrpc_merge_check_fast_forwardable() {
     git(&local, &["push", "origin", "feature"]);
 
     // mergeCheck should show non-conflicted (feature is ahead of main)
-    let (status, body) = server.post(
-        "/xrpc/sh.tangled.repo.mergeCheck",
-        &serde_json::json!({
-            "did": "did:plc:testowner",
-            "name": "merge-ff",
-            "branch": "feature"
-        }),
-    )
-    .await;
+    let (status, body) = server
+        .post(
+            "/xrpc/sh.tangled.repo.mergeCheck",
+            &serde_json::json!({
+                "did": "did:plc:testowner",
+                "name": "merge-ff",
+                "branch": "feature"
+            }),
+        )
+        .await;
     assert_eq!(status, 200, "body={body}");
     assert_eq!(body["is_conflicted"], false);
 }
@@ -1520,11 +1617,12 @@ async fn xrpc_merge_check_fast_forwardable() {
 async fn xrpc_merge_fast_forward() {
     let server = AuthServer::start().await;
 
-    let (_, _create_body) = server.post(
-        "/xrpc/sh.tangled.repo.create",
-        &serde_json::json!({"name": "merge-ff2", "rkey": "merge-ff2"}),
-    )
-    .await;
+    let (_, _create_body) = server
+        .post(
+            "/xrpc/sh.tangled.repo.create",
+            &serde_json::json!({"name": "merge-ff2", "rkey": "merge-ff2"}),
+        )
+        .await;
 
     let repo_path = server
         .tmpdir
@@ -1538,7 +1636,10 @@ async fn xrpc_merge_fast_forward() {
     std::fs::write(local.join("f.txt"), "v1\n").unwrap();
     git(&local, &["add", "."]);
     git(&local, &["commit", "-m", "v1"]);
-    git(&local, &["remote", "add", "origin", repo_path.to_str().unwrap()]);
+    git(
+        &local,
+        &["remote", "add", "origin", repo_path.to_str().unwrap()],
+    );
     git(&local, &["push", "origin", "main"]);
     git(&local, &["checkout", "-b", "feature"]);
     std::fs::write(local.join("f.txt"), "v2\n").unwrap();
@@ -1547,15 +1648,16 @@ async fn xrpc_merge_fast_forward() {
     git(&local, &["push", "origin", "feature"]);
 
     // Merge feature into main (fast-forward)
-    let (status, body) = server.post(
-        "/xrpc/sh.tangled.repo.merge",
-        &serde_json::json!({
-            "did": "did:plc:testowner",
-            "name": "merge-ff2",
-            "branch": "feature"
-        }),
-    )
-    .await;
+    let (status, body) = server
+        .post(
+            "/xrpc/sh.tangled.repo.merge",
+            &serde_json::json!({
+                "did": "did:plc:testowner",
+                "name": "merge-ff2",
+                "branch": "feature"
+            }),
+        )
+        .await;
     assert_eq!(status, 200, "body={body}");
 }
 
@@ -1563,11 +1665,12 @@ async fn xrpc_merge_fast_forward() {
 async fn xrpc_hidden_ref_set_and_get() {
     let server = AuthServer::start().await;
 
-    let (_, create_body) = server.post(
-        "/xrpc/sh.tangled.repo.create",
-        &serde_json::json!({"name": "hidden-test", "rkey": "hidden-test"}),
-    )
-    .await;
+    let (_, create_body) = server
+        .post(
+            "/xrpc/sh.tangled.repo.create",
+            &serde_json::json!({"name": "hidden-test", "rkey": "hidden-test"}),
+        )
+        .await;
     let _repo_did = create_body["repoDid"].as_str().unwrap();
 
     let repo_path = server
@@ -1582,19 +1685,23 @@ async fn xrpc_hidden_ref_set_and_get() {
     std::fs::write(local.join("f.txt"), "data\n").unwrap();
     git(&local, &["add", "."]);
     git(&local, &["commit", "-m", "init"]);
-    git(&local, &["remote", "add", "origin", repo_path.to_str().unwrap()]);
+    git(
+        &local,
+        &["remote", "add", "origin", repo_path.to_str().unwrap()],
+    );
     git(&local, &["push", "origin", "main"]);
 
     // Set a hidden ref tracking main
-    let (status, body) = server.post(
-        "/xrpc/sh.tangled.repo.hiddenRef",
-        &serde_json::json!({
-            "forkRef": "upstream-head",
-            "remoteRef": "main",
-            "repo": format!("did:plc:testowner/hidden-test")
-        }),
-    )
-    .await;
+    let (status, body) = server
+        .post(
+            "/xrpc/sh.tangled.repo.hiddenRef",
+            &serde_json::json!({
+                "forkRef": "upstream-head",
+                "remoteRef": "main",
+                "repo": format!("did:plc:testowner/hidden-test")
+            }),
+        )
+        .await;
     assert_eq!(status, 200, "body={body}");
     assert_eq!(body["success"], true);
 }
@@ -1603,11 +1710,12 @@ async fn xrpc_hidden_ref_set_and_get() {
 async fn xrpc_fork_status_up_to_date() {
     let server = AuthServer::start().await;
 
-    let (_, _create_body) = server.post(
-        "/xrpc/sh.tangled.repo.create",
-        &serde_json::json!({"name": "fork-status", "rkey": "fork-status"}),
-    )
-    .await;
+    let (_, _create_body) = server
+        .post(
+            "/xrpc/sh.tangled.repo.create",
+            &serde_json::json!({"name": "fork-status", "rkey": "fork-status"}),
+        )
+        .await;
 
     let repo_path = server
         .tmpdir
@@ -1621,32 +1729,37 @@ async fn xrpc_fork_status_up_to_date() {
     std::fs::write(local.join("f.txt"), "data\n").unwrap();
     git(&local, &["add", "."]);
     git(&local, &["commit", "-m", "init"]);
-    git(&local, &["remote", "add", "origin", repo_path.to_str().unwrap()]);
+    git(
+        &local,
+        &["remote", "add", "origin", repo_path.to_str().unwrap()],
+    );
     git(&local, &["push", "origin", "main"]);
 
     // Track main as hidden ref
-    server.post(
-        "/xrpc/sh.tangled.repo.hiddenRef",
-        &serde_json::json!({
-            "forkRef": "main",
-            "remoteRef": "main",
-            "repo": format!("did:plc:testowner/fork-status")
-        }),
-    )
-    .await;
+    server
+        .post(
+            "/xrpc/sh.tangled.repo.hiddenRef",
+            &serde_json::json!({
+                "forkRef": "main",
+                "remoteRef": "main",
+                "repo": format!("did:plc:testowner/fork-status")
+            }),
+        )
+        .await;
 
     // Check forkStatus — should be up to date (0)
-    let (status, body) = server.post(
-        "/xrpc/sh.tangled.repo.forkStatus",
-        &serde_json::json!({
-            "did": "did:plc:testowner",
-            "source": "did:plc:testowner/fork-status",
-            "branch": "main",
-            "hiddenRef": "main",
-            "name": "fork-status"
-        }),
-    )
-    .await;
+    let (status, body) = server
+        .post(
+            "/xrpc/sh.tangled.repo.forkStatus",
+            &serde_json::json!({
+                "did": "did:plc:testowner",
+                "source": "did:plc:testowner/fork-status",
+                "branch": "main",
+                "hiddenRef": "main",
+                "name": "fork-status"
+            }),
+        )
+        .await;
     assert_eq!(status, 200, "body={body}");
     assert_eq!(body["status"], 0, "expected up-to-date (0), got {body}");
 }
@@ -1728,4 +1841,484 @@ async fn xrpc_write_non_owner_denied() {
         );
         assert_eq!(body["error"], "Unauthorized");
     }
+}
+
+// ---------------------------------------------------------------------------
+// Repo space (private repo membership) tests
+// ---------------------------------------------------------------------------
+
+/// Create a private repo through the XRPC endpoint; returns repo DID.
+async fn create_private_repo(server: &AuthServer, rkey: &str) -> String {
+    let (status, body) = server
+        .post(
+            "/xrpc/sh.tangled.repo.create",
+            &serde_json::json!({"name": rkey, "rkey": rkey, "visibility": "private"}),
+        )
+        .await;
+    assert_eq!(status, 200, "body={body}");
+    body["repoDid"].as_str().unwrap().to_string()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn xrpc_space_private_repo_lifecycle() {
+    let server = AuthServer::start().await;
+    let repo_did = create_private_repo(&server, "priv").await;
+    let repo_param = format!("{TEST_ISSUER_DID}/priv");
+
+    // Anonymous reads 404 — existence must not leak.
+    let q = format!("/xrpc/sh.tangled.repo.branches?repo={repo_param}");
+    let (status, _) = fetch_json(&server, &q).await;
+    assert!(status >= 400, "anonymous read returned {status}");
+    let q = format!("/xrpc/sh.tangled.space.getSpace?repo={repo_did}");
+    let (status, _) = fetch_json(&server, &q).await;
+    assert!(status >= 400, "anonymous getSpace returned {status}");
+
+    // Non-owner addMember is rejected; unauthenticated is 401.
+    let (status, _) = server
+        .post_member(
+            "/xrpc/sh.tangled.space.addMember",
+            &serde_json::json!({"repo": repo_did, "member": TEST_MEMBER_DID}),
+        )
+        .await;
+    assert!(status >= 400, "non-owner addMember returned {status}");
+    let (status, _) = server
+        .post_unauthed(
+            "/xrpc/sh.tangled.space.addMember",
+            &serde_json::json!({"repo": repo_did, "member": TEST_MEMBER_DID}),
+        )
+        .await;
+    assert_eq!(status, 401);
+
+    // Owner adds the member; getSpace as member shows membership and the
+    // spec-shaped space URI.
+    let (status, body) = server
+        .post(
+            "/xrpc/sh.tangled.space.addMember",
+            &serde_json::json!({"repo": repo_did, "member": TEST_MEMBER_DID}),
+        )
+        .await;
+    assert_eq!(status, 200, "body={body}");
+
+    let q = format!("/xrpc/sh.tangled.space.getSpace?repo={repo_did}");
+    let (status, body) = server.get_member(&q).await;
+    assert_eq!(status, 200, "body={body}");
+    assert_eq!(
+        body["space"].as_str().unwrap(),
+        format!("at://{TEST_AUDIENCE_DID}/space/sh.tangled.repo/{repo_did}")
+    );
+    assert_eq!(body["visibility"], "private");
+    assert_eq!(body["members"][0]["did"], TEST_MEMBER_DID);
+
+    // Member can now read; listMembers works for the member too.
+    let q = format!("/xrpc/sh.tangled.repo.branches?repo={repo_param}");
+    let (status, _) = server.get_member(&q).await;
+    assert_eq!(status, 200);
+    let q = format!("/xrpc/sh.tangled.space.listMembers?repo={repo_did}");
+    let (status, body) = server.get_member(&q).await;
+    assert_eq!(status, 200, "body={body}");
+    assert_eq!(body["members"][0]["did"], TEST_MEMBER_DID);
+
+    // Anonymous cannot list members.
+    let q = format!("/xrpc/sh.tangled.space.listMembers?repo={repo_did}");
+    let (status, _) = fetch_json(&server, &q).await;
+    assert!(status >= 400);
+
+    // Remove the member — access is revoked.
+    let (status, _) = server
+        .post(
+            "/xrpc/sh.tangled.space.removeMember",
+            &serde_json::json!({"repo": repo_did, "member": TEST_MEMBER_DID}),
+        )
+        .await;
+    assert_eq!(status, 200);
+    let q = format!("/xrpc/sh.tangled.repo.branches?repo={repo_param}");
+    let (status, _) = server.get_member(&q).await;
+    assert!(status >= 400, "removed member still had access: {status}");
+
+    // Owner always retains access.
+    let q = format!("/xrpc/sh.tangled.repo.branches?repo={repo_param}");
+    let (status, _) = server.get_owner(&q).await;
+    assert_eq!(status, 200);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn xrpc_space_visibility_toggle() {
+    let server = AuthServer::start().await;
+    let repo_did = create_private_repo(&server, "priv2").await;
+    let repo_param = format!("{TEST_ISSUER_DID}/priv2");
+
+    // Flip to public — anonymous reads start working.
+    let (status, body) = server
+        .post(
+            "/xrpc/sh.tangled.repo.setVisibility",
+            &serde_json::json!({"repo": repo_did, "visibility": "public"}),
+        )
+        .await;
+    assert_eq!(status, 200, "body={body}");
+    let q = format!("/xrpc/sh.tangled.repo.branches?repo={repo_param}");
+    let (status, _) = fetch_json(&server, &q).await;
+    assert_eq!(status, 200);
+
+    // Flip back to private — anonymous reads stop.
+    let (status, _) = server
+        .post(
+            "/xrpc/sh.tangled.repo.setVisibility",
+            &serde_json::json!({"repo": repo_did, "visibility": "private"}),
+        )
+        .await;
+    assert_eq!(status, 200);
+    let q = format!("/xrpc/sh.tangled.repo.branches?repo={repo_param}");
+    let (status, _) = fetch_json(&server, &q).await;
+    assert!(status >= 400);
+
+    // Non-owner cannot setVisibility.
+    let (status, _) = server
+        .post_member(
+            "/xrpc/sh.tangled.repo.setVisibility",
+            &serde_json::json!({"repo": repo_did, "visibility": "public"}),
+        )
+        .await;
+    assert!(status >= 400, "non-owner setVisibility returned {status}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn xrpc_space_public_repo_get_space() {
+    let server = AuthServer::start().await;
+    let (status, body) = server
+        .post(
+            "/xrpc/sh.tangled.repo.create",
+            &serde_json::json!({"name": "pub1", "rkey": "pub1"}),
+        )
+        .await;
+    assert_eq!(status, 200, "body={body}");
+    let repo_did = body["repoDid"].as_str().unwrap();
+
+    // getSpace is anonymous-readable for public repos.
+    let q = format!("/xrpc/sh.tangled.space.getSpace?repo={repo_did}");
+    let (status, body) = fetch_json(&server, &q).await;
+    assert_eq!(status, 200, "body={body}");
+    assert_eq!(body["visibility"], "public");
+    assert_eq!(
+        body["space"].as_str().unwrap(),
+        format!("at://{TEST_AUDIENCE_DID}/space/sh.tangled.repo/{repo_did}")
+    );
+
+    // listMembers on a public repo is empty.
+    let q = format!("/xrpc/sh.tangled.space.listMembers?repo={repo_did}");
+    let (status, body) = fetch_json(&server, &q).await;
+    assert_eq!(status, 200, "body={body}");
+    assert!(body["members"].as_array().unwrap().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn xrpc_space_visibility_validation() {
+    let server = AuthServer::start().await;
+
+    // Invalid visibility in create is rejected before anything is created.
+    let (status, body) = server
+        .post(
+            "/xrpc/sh.tangled.repo.create",
+            &serde_json::json!({"name": "bad", "rkey": "bad", "visibility": "secret"}),
+        )
+        .await;
+    assert_eq!(status, 400, "body={body}");
+
+    // setVisibility also validates.
+    let repo_did = create_private_repo(&server, "bad2").await;
+    let (status, body) = server
+        .post(
+            "/xrpc/sh.tangled.repo.setVisibility",
+            &serde_json::json!({"repo": repo_did, "visibility": "friendsonly"}),
+        )
+        .await;
+    assert_eq!(status, 400, "body={body}");
+
+    // addMember requires a DID-shaped member.
+    let (status, body) = server
+        .post(
+            "/xrpc/sh.tangled.space.addMember",
+            &serde_json::json!({"repo": repo_did, "member": "bob"}),
+        )
+        .await;
+    assert_eq!(status, 400, "body={body}");
+}
+
+// ---------------------------------------------------------------------------
+// Collaborator (push access) tests
+// ---------------------------------------------------------------------------
+
+const TEST_READER_DID: &str = "did:plc:testreader";
+
+/// A well-formed fake authorized_keys blob for `name`.
+fn fake_ssh_key(name: &str) -> String {
+    use base64::Engine;
+    format!(
+        "ssh-ed25519 {}",
+        base64::engine::general_purpose::STANDARD.encode(format!("vlecht-test-key-{name}"))
+    )
+}
+
+/// GET with reqwest query encoding and an optional owner JWT.
+async fn get_query(
+    server: &AuthServer,
+    path: &str,
+    query: &[(&str, &str)],
+    as_owner: bool,
+) -> (u16, serde_json::Value) {
+    let client = reqwest::Client::new();
+    let mut req = client.get(server.handle.url(path)).query(query);
+    if as_owner {
+        let lxm = path.trim_start_matches("/xrpc/");
+        let jwt =
+            mint_service_auth_jwt(TEST_ISSUER_DID, TEST_AUDIENCE_DID, lxm, &server.signing_key);
+        req = req.header("Authorization", format!("Bearer {jwt}"));
+    }
+    let resp = req.send().await.unwrap();
+    let status = resp.status().as_u16();
+    let body: serde_json::Value = resp.json().await.unwrap_or_default();
+    (status, body)
+}
+
+async fn create_public_repo(server: &AuthServer, rkey: &str) -> String {
+    let (status, body) = server
+        .post(
+            "/xrpc/sh.tangled.repo.create",
+            &serde_json::json!({"name": rkey, "rkey": rkey}),
+        )
+        .await;
+    assert_eq!(status, 200, "body={body}");
+    body["repoDid"].as_str().unwrap().to_string()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn xrpc_collaborators_lifecycle() {
+    use vlecht_db::RepoStore;
+
+    let server = AuthServer::start().await;
+    let repo_did = create_public_repo(&server, "collab1").await;
+
+    // Register SSH keys so checkPushAllowed can resolve DIDs.
+    let member_key = fake_ssh_key("member");
+    let reader_key = fake_ssh_key("reader");
+    let db = server.db().await;
+    db.add_did(TEST_MEMBER_DID).await.unwrap();
+    db.add_did(TEST_READER_DID).await.unwrap();
+    db.add_public_key(TEST_MEMBER_DID, &member_key, "1970-01-01T00:00:00Z")
+        .await
+        .unwrap();
+    db.add_public_key(TEST_READER_DID, &reader_key, "1970-01-01T00:00:00Z")
+        .await
+        .unwrap();
+
+    // Non-owner cannot add collaborators.
+    let (status, _) = server
+        .post_member(
+            "/xrpc/sh.tangled.repo.addCollaborator",
+            &serde_json::json!({"repo": repo_did, "subject": TEST_MEMBER_DID}),
+        )
+        .await;
+    assert!(status >= 400, "non-owner addCollaborator returned {status}");
+
+    // Subject == owner is a no-op 200 (Go knotserver behavior).
+    let (status, _) = server
+        .post(
+            "/xrpc/sh.tangled.repo.addCollaborator",
+            &serde_json::json!({"repo": repo_did, "subject": TEST_ISSUER_DID}),
+        )
+        .await;
+    assert_eq!(status, 200);
+
+    // Unknown repo 404s; non-DID repo 400s.
+    let (status, _) = server
+        .post(
+            "/xrpc/sh.tangled.repo.addCollaborator",
+            &serde_json::json!({"repo": "did:plc:missing", "subject": TEST_MEMBER_DID}),
+        )
+        .await;
+    assert!(status >= 400);
+    let (status, body) = server
+        .post(
+            "/xrpc/sh.tangled.repo.addCollaborator",
+            &serde_json::json!({"repo": "not-a-did", "subject": TEST_MEMBER_DID}),
+        )
+        .await;
+    assert_eq!(status, 400, "body={body}");
+
+    // Owner adds the member as a collaborator.
+    let (status, _) = server
+        .post(
+            "/xrpc/sh.tangled.repo.addCollaborator",
+            &serde_json::json!({"repo": repo_did, "subject": TEST_MEMBER_DID}),
+        )
+        .await;
+    assert_eq!(status, 200);
+
+    // listCollaborators is public on public repos, Go-shaped output.
+    let (status, body) = get_query(
+        &server,
+        "/xrpc/sh.tangled.repo.listCollaborators",
+        &[("subject", repo_did.as_str())],
+        false,
+    )
+    .await;
+    assert_eq!(status, 200, "body={body}");
+    let items = body["items"].as_array().unwrap();
+    assert_eq!(items.len(), 1, "body={body}");
+    assert_eq!(items[0]["subject"], TEST_MEMBER_DID);
+    assert_eq!(items[0]["addedBy"], TEST_ISSUER_DID);
+    assert!(items[0]["createdAt"].is_string());
+
+    // checkPushAllowed: collaborator key → allowed.
+    let (status, body) = get_query(
+        &server,
+        "/xrpc/sh.tangled.repo.checkPushAllowed",
+        &[("repo", repo_did.as_str()), ("key", member_key.as_str())],
+        false,
+    )
+    .await;
+    assert_eq!(status, 200, "body={body}");
+    assert_eq!(body["allowed"], true);
+    assert_eq!(body["did"], TEST_MEMBER_DID);
+
+    // Reader-role members cannot push.
+    let (status, _) = server
+        .post(
+            "/xrpc/sh.tangled.space.addMember",
+            &serde_json::json!({"repo": repo_did, "member": TEST_READER_DID}),
+        )
+        .await;
+    assert_eq!(status, 200);
+    let (status, body) = get_query(
+        &server,
+        "/xrpc/sh.tangled.repo.checkPushAllowed",
+        &[("repo", repo_did.as_str()), ("key", reader_key.as_str())],
+        false,
+    )
+    .await;
+    assert_eq!(status, 200, "body={body}");
+    assert_eq!(body["allowed"], false);
+    assert_eq!(body["did"], TEST_READER_DID);
+
+    // Unknown key → allowed false, no did.
+    let (status, body) = get_query(
+        &server,
+        "/xrpc/sh.tangled.repo.checkPushAllowed",
+        &[
+            ("repo", repo_did.as_str()),
+            ("key", fake_ssh_key("unknown").as_str()),
+        ],
+        false,
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(body["allowed"], false);
+    assert!(body["did"].is_null());
+
+    // Malformed key → 400.
+    let (status, _) = get_query(
+        &server,
+        "/xrpc/sh.tangled.repo.checkPushAllowed",
+        &[("repo", repo_did.as_str()), ("key", "garbage")],
+        false,
+    )
+    .await;
+    assert_eq!(status, 400);
+
+    // Remove the collaborator — push access revoked.
+    let (status, _) = server
+        .post(
+            "/xrpc/sh.tangled.repo.removeCollaborator",
+            &serde_json::json!({"repo": repo_did, "subject": TEST_MEMBER_DID}),
+        )
+        .await;
+    assert_eq!(status, 200);
+    let (status, body) = get_query(
+        &server,
+        "/xrpc/sh.tangled.repo.checkPushAllowed",
+        &[("repo", repo_did.as_str()), ("key", member_key.as_str())],
+        false,
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(body["allowed"], false);
+
+    let (status, body) = get_query(
+        &server,
+        "/xrpc/sh.tangled.repo.listCollaborators",
+        &[("subject", repo_did.as_str())],
+        false,
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert!(body["items"].as_array().unwrap().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn xrpc_collaborators_private_repo_gating() {
+    use vlecht_db::RepoStore;
+
+    let server = AuthServer::start().await;
+    let repo_did = create_private_repo(&server, "collabpriv").await;
+
+    let member_key = fake_ssh_key("member2");
+    let db = server.db().await;
+    db.add_did(TEST_MEMBER_DID).await.unwrap();
+    db.add_public_key(TEST_MEMBER_DID, &member_key, "1970-01-01T00:00:00Z")
+        .await
+        .unwrap();
+
+    let (status, _) = server
+        .post(
+            "/xrpc/sh.tangled.repo.addCollaborator",
+            &serde_json::json!({"repo": repo_did, "subject": TEST_MEMBER_DID}),
+        )
+        .await;
+    assert_eq!(status, 200);
+
+    // Anonymous listing/check on a private repo must not leak.
+    let (status, _) = get_query(
+        &server,
+        "/xrpc/sh.tangled.repo.listCollaborators",
+        &[("subject", repo_did.as_str())],
+        false,
+    )
+    .await;
+    assert!(status >= 400, "anonymous list on private returned {status}");
+    let (status, _) = get_query(
+        &server,
+        "/xrpc/sh.tangled.repo.checkPushAllowed",
+        &[("repo", repo_did.as_str()), ("key", member_key.as_str())],
+        false,
+    )
+    .await;
+    assert!(
+        status >= 400,
+        "anonymous check on private returned {status}"
+    );
+
+    // The member themselves may check own push rights (not a leak).
+    let lxm = "sh.tangled.repo.checkPushAllowed";
+    let jwt = mint_service_auth_jwt(
+        TEST_MEMBER_DID,
+        TEST_AUDIENCE_DID,
+        lxm,
+        &server.member_signing_key,
+    );
+    let client = reqwest::Client::new();
+    let resp = client
+        .get(server.handle.url("/xrpc/sh.tangled.repo.checkPushAllowed"))
+        .query(&[("repo", repo_did.as_str()), ("key", member_key.as_str())])
+        .header("Authorization", format!("Bearer {jwt}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["allowed"], true);
+    assert_eq!(body["did"], TEST_MEMBER_DID);
+
+    // Collaborator on a private repo can read too (writer is a member role).
+    let q = format!("/xrpc/sh.tangled.repo.branches?repo={TEST_ISSUER_DID}/collabpriv");
+    let (status, _) = server.get_member(&q).await;
+    assert_eq!(status, 200);
 }

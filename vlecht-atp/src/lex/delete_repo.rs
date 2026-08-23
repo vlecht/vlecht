@@ -28,7 +28,7 @@ pub async fn handler(
     let repo_did = assert_owns_by_name(&state, &actor_did, &body.did, &body.name).await?;
 
     // Find and remove the repo from disk
-    let repo_path = resolve_repo_path(&state, &repo_did).await?;
+    let repo_path = resolve_repo_path(&state, &repo_did, Some(&actor_did)).await?;
     std::fs::remove_dir_all(&repo_path)
         .map_err(|e| XrpcError::InternalServerError(e.to_string()))?;
 

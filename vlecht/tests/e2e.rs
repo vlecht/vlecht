@@ -1,8 +1,8 @@
+use vlecht_db::RepoStore;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::OnceLock;
-use vlecht_db::RepoStore;
 
 static NEXT_PORT: AtomicU16 = AtomicU16::new(15000);
 
@@ -22,9 +22,14 @@ fn shared_ssh_key() -> PathBuf {
             .args(["-t", "ed25519", "-f", key.to_str().unwrap(), "-N", "", "-q"])
             .output()
             .expect("ssh-keygen should be installed");
-        assert!(out.status.success(), "ssh-keygen failed: {}", String::from_utf8_lossy(&out.stderr));
+        assert!(
+            out.status.success(),
+            "ssh-keygen failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
         key
-    }).clone()
+    })
+    .clone()
 }
 
 /// Create an empty temporary directory for a test.
@@ -148,11 +153,13 @@ impl ServerHandle {
         let path = self.tmpdir.join("repos").join(owner).join(name);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         vlecht_git::GitRepo::init_bare(&path, "main").unwrap();
-        // Track in DB so ownership auth passes for pushes.
+        // Track in DB so ownership auth passes for pushes. Use the same
+        // deterministic repo DID derivation as the create endpoints.
         let owner_did = format!("did:plc:{owner}");
+        let repo_did = vlecht_atp::lex::derive_repo_did(&owner_did, name);
         self.db.add_did(&owner_did).await.unwrap();
         self.db
-            .create_repo(&owner_did, None, &owner_did, name, "k256")
+            .create_repo(&repo_did, None, &owner_did, name, "k256")
             .await
             .unwrap();
         path
@@ -452,7 +459,11 @@ async fn e2e_git_push_delete_branch() {
     let remote = format!("http://127.0.0.1:{port}/alice/deletebranch");
     git(&local, &["remote", "add", "origin", &remote]);
     git_push(&local, &["push", "origin", "main"], "did:plc:alice");
-    git_push(&local, &["push", "origin", "main:to-delete"], "did:plc:alice");
+    git_push(
+        &local,
+        &["push", "origin", "main:to-delete"],
+        "did:plc:alice",
+    );
     // Verify the branch was created
     let branches = vlecht_git::GitRepo::open(&repo_path)
         .unwrap()
@@ -474,7 +485,11 @@ async fn e2e_git_push_delete_branch() {
         "to-delete should appear in ls-remote before delete\n{ls}"
     );
     // Delete with full refspec
-    git_push(&local, &["push", "origin", ":refs/heads/to-delete"], "did:plc:alice");
+    git_push(
+        &local,
+        &["push", "origin", ":refs/heads/to-delete"],
+        "did:plc:alice",
+    );
 
     let branches = vlecht_git::GitRepo::open(&repo_path)
         .unwrap()
@@ -1052,4 +1067,309 @@ async fn e2e_xrpc_branches_returns_repo_branches() {
     assert_eq!(resp.status(), 200);
     let body: serde_json::Value = resp.json().await.unwrap();
     assert!(body["branches"].is_array());
+}
+
+// ---------------------------------------------------------------------------
+// Private repo (spaces) visibility tests
+// ---------------------------------------------------------------------------
+
+/// Run a git command expected to fail; returns stderr.
+fn git_fail(repo: &Path, args: &[&str], extra_header: Option<String>) -> String {
+    let mut cmd: Vec<String> = vec!["-c".into(), "init.defaultBranch=main".into()];
+    cmd.extend(git_global_config().iter().map(|s| s.to_string()));
+    if let Some(h) = extra_header {
+        cmd.push("-c".into());
+        cmd.push(h);
+    }
+    cmd.extend(args.iter().map(|s| s.to_string()));
+    let out = Command::new("git")
+        .args(&cmd)
+        .current_dir(repo)
+        .env("GIT_ASKPASS", "/bin/true")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .output()
+        .expect("git should be installed");
+    assert!(
+        !out.status.success(),
+        "expected git {args:?} to fail, but it succeeded"
+    );
+    String::from_utf8_lossy(&out.stderr).to_string()
+}
+
+/// Run an SSH git command expected to fail; returns stderr.
+fn git_ssh_fail(repo: &Path, args: &[&str], ssh_cmd: &str) -> String {
+    let mut cmd = vec!["-c", "init.defaultBranch=main"];
+    cmd.extend(git_global_config());
+    cmd.extend(git_ssh_config());
+    cmd.extend(args);
+    let out = Command::new("git")
+        .args(&cmd)
+        .current_dir(repo)
+        .env("GIT_ASKPASS", "/bin/true")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_SSH_COMMAND", ssh_cmd)
+        .output()
+        .expect("git should be installed");
+    assert!(
+        !out.status.success(),
+        "expected git {args:?} to fail, but it succeeded"
+    );
+    String::from_utf8_lossy(&out.stderr).to_string()
+}
+
+fn gen_ssh_key(dir: &Path, name: &str) -> PathBuf {
+    let key = dir.join(name);
+    let out = Command::new("ssh-keygen")
+        .args(["-t", "ed25519", "-f", key.to_str().unwrap(), "-N", "", "-q"])
+        .output()
+        .expect("ssh-keygen should be installed");
+    assert!(
+        out.status.success(),
+        "ssh-keygen failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    key
+}
+
+fn ssh_cmd_for(key: &Path) -> String {
+    format!(
+        "ssh -i {} -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null",
+        key.display()
+    )
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_private_repo_http_visibility() {
+    let port = unique_port();
+    let server = ServerHandle::start(port, None).await;
+    server.init_repo("alice", "priv").await;
+
+    let repo_did = vlecht_atp::lex::derive_repo_did("did:plc:alice", "priv");
+    server.db.add_did("did:plc:bob").await.unwrap();
+    server
+        .db
+        .set_repo_visibility(&repo_did, "private")
+        .await
+        .unwrap();
+    server
+        .db
+        .add_repo_member(&repo_did, "did:plc:bob", Some("did:plc:alice"), "reader")
+        .await
+        .unwrap();
+
+    // Seed a commit (push as the owner).
+    let wd = server.workdir("privseed");
+    let local = wd.join("src");
+    std::fs::create_dir_all(&local).unwrap();
+    git(&local, &["init"]);
+    std::fs::write(local.join("secret.txt"), "s3kr3t\n").unwrap();
+    git(&local, &["add", "."]);
+    git(&local, &["commit", "-m", "secret"]);
+    let url = server.http_url("alice", "priv");
+    git_push(&local, &["push", &url, "main"], "did:plc:alice");
+
+    // Anonymous clone: denied with 404 (existence must not leak).
+    let anon = server.workdir("anonclone");
+    let stderr = git_fail(&anon, &["clone", &url, "dst"], None);
+    assert!(
+        stderr.contains("not found") || stderr.contains("404"),
+        "{stderr}"
+    );
+
+    // Authenticated non-member: still denied.
+    let mallory = server.workdir("malloryclone");
+    let stderr = git_fail(
+        &mallory,
+        &["clone", &url, "dst"],
+        Some("http.extraHeader=X-Vlecht-DID: did:plc:mallory".into()),
+    );
+    assert!(
+        stderr.contains("not found") || stderr.contains("404"),
+        "{stderr}"
+    );
+
+    // Owner and member clones work.
+    let owner_wd = server.workdir("ownerclone");
+    git_push(&owner_wd, &["clone", &url, "dst"], "did:plc:alice");
+    assert_eq!(
+        std::fs::read_to_string(owner_wd.join("dst").join("secret.txt")).unwrap(),
+        "s3kr3t\n"
+    );
+
+    let member_wd = server.workdir("memberclone");
+    git_push(&member_wd, &["clone", &url, "dst"], "did:plc:bob");
+    assert_eq!(
+        std::fs::read_to_string(member_wd.join("dst").join("secret.txt")).unwrap(),
+        "s3kr3t\n"
+    );
+
+    // Browse API is gated the same way: anonymous 404, member 200.
+    let client = reqwest::Client::new();
+    let tree_url = format!("http://127.0.0.1:{port}/alice/priv/tree");
+    let resp = client.get(&tree_url).send().await.unwrap();
+    assert_eq!(resp.status(), 404);
+    let resp = client
+        .get(&tree_url)
+        .header("X-Vlecht-DID", "did:plc:bob")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    // Removing the member revokes clone access.
+    server
+        .db
+        .remove_repo_member(&repo_did, "did:plc:bob")
+        .await
+        .unwrap();
+    let bob2 = server.workdir("bobclone2");
+    let stderr = git_fail(
+        &bob2,
+        &["clone", &url, "dst"],
+        Some("http.extraHeader=X-Vlecht-DID: did:plc:bob".into()),
+    );
+    assert!(
+        stderr.contains("not found") || stderr.contains("404"),
+        "{stderr}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_private_repo_ssh_visibility() {
+    let http_port = unique_port();
+    let ssh_port = unique_port();
+    let server = ServerHandle::start(http_port, Some(ssh_port)).await;
+    let ssh_cmd = server.ssh_command();
+    let repo_path = server.init_repo("alice", "privssh").await;
+
+    let repo_did = vlecht_atp::lex::derive_repo_did("did:plc:alice", "privssh");
+    server
+        .db
+        .set_repo_visibility(&repo_did, "private")
+        .await
+        .unwrap();
+
+    // Seed via direct local push into the bare repo.
+    let wd = server.workdir("ssh_priv_work");
+    let src = wd.join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    git(&src, &["init"]);
+    std::fs::write(src.join("secret.txt"), "ssh-secret\n").unwrap();
+    git(&src, &["add", "."]);
+    git(&src, &["commit", "-m", "secret"]);
+    git(
+        &src,
+        &["remote", "add", "origin", repo_path.to_str().unwrap()],
+    );
+    git(&src, &["push", "origin", "main"]);
+
+    // Owner (shared key -> did:plc:alice) can clone.
+    let owner_dest = wd.join("owner_clone");
+    git_ssh(
+        &wd,
+        &[
+            "clone",
+            &server.ssh_url("alice", "privssh"),
+            owner_dest.to_str().unwrap(),
+        ],
+        &ssh_cmd,
+    );
+    assert_eq!(
+        std::fs::read_to_string(owner_dest.join("secret.txt")).unwrap(),
+        "ssh-secret\n"
+    );
+
+    // Unregistered key: denied at SSH auth, before any git protocol runs.
+    let keys_wd = server.workdir("keys");
+    let mallory_key = gen_ssh_key(&keys_wd, "mallory_ed25519");
+    let mallory_cmd = ssh_cmd_for(&mallory_key);
+    let stderr = git_ssh_fail(
+        &wd,
+        &[
+            "clone",
+            &server.ssh_url("alice", "privssh"),
+            wd.join("mallory_clone").to_str().unwrap(),
+        ],
+        &mallory_cmd,
+    );
+    assert!(stderr.contains("Permission denied"), "{stderr}");
+
+    // Registered member: granted after being added.
+    let bob_key = gen_ssh_key(&keys_wd, "bob_ed25519");
+    let bob_pub = std::fs::read_to_string(bob_key.with_extension("pub")).unwrap();
+    server.db.add_did("did:plc:bob").await.unwrap();
+    server
+        .db
+        .add_public_key("did:plc:bob", bob_pub.trim(), "1970-01-01T00:00:00Z")
+        .await
+        .unwrap();
+
+    // Before membership: denied.
+    let bob_cmd = ssh_cmd_for(&bob_key);
+    let stderr = git_ssh_fail(
+        &wd,
+        &[
+            "clone",
+            &server.ssh_url("alice", "privssh"),
+            wd.join("bob_clone_early").to_str().unwrap(),
+        ],
+        &bob_cmd,
+    );
+    assert!(stderr.contains("not found"), "{stderr}");
+
+    // After membership: allowed.
+    server
+        .db
+        .add_repo_member(&repo_did, "did:plc:bob", Some("did:plc:alice"), "reader")
+        .await
+        .unwrap();
+    let bob_dest = wd.join("bob_clone");
+    git_ssh(
+        &wd,
+        &[
+            "clone",
+            &server.ssh_url("alice", "privssh"),
+            bob_dest.to_str().unwrap(),
+        ],
+        &bob_cmd,
+    );
+    assert_eq!(
+        std::fs::read_to_string(bob_dest.join("secret.txt")).unwrap(),
+        "ssh-secret\n"
+    );
+
+    // Reader-role members cannot push.
+    let src2 = bob_dest.clone();
+    std::fs::write(src2.join("more.txt"), "nope\n").unwrap();
+    git(&src2, &["add", "."]);
+    git(&src2, &["commit", "-m", "member push attempt"]);
+    let stderr = git_ssh_fail(&src2, &["push", "origin", "main"], &bob_cmd);
+    assert!(
+        stderr.contains("denied") || stderr.contains("not authorized"),
+        "{stderr}"
+    );
+
+    // Promoted to writer (collaborator): the same member may push.
+    server
+        .db
+        .add_repo_member(&repo_did, "did:plc:bob", Some("did:plc:alice"), "writer")
+        .await
+        .unwrap();
+    git_ssh(&src2, &["push", "origin", "main"], &bob_cmd);
+
+    // Verify the push landed by cloning fresh as the owner.
+    let verify_dest = wd.join("verify_clone");
+    git_ssh(
+        &wd,
+        &[
+            "clone",
+            &server.ssh_url("alice", "privssh"),
+            verify_dest.to_str().unwrap(),
+        ],
+        &ssh_cmd,
+    );
+    assert_eq!(
+        std::fs::read_to_string(verify_dest.join("more.txt")).unwrap(),
+        "nope\n"
+    );
 }

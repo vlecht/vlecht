@@ -113,7 +113,12 @@ impl russh::server::Handler for GitSession {
         // Resolve the offered key to a DID via the public_keys table.
         let offered = match key.to_openssh().ok().and_then(|s| normalize_pubkey(&s)) {
             Some(n) => n,
-            None => return Ok(russh::server::Auth::Reject { proceed_with_methods: None, partial_success: false }),
+            None => {
+                return Ok(russh::server::Auth::Reject {
+                    proceed_with_methods: None,
+                    partial_success: false,
+                })
+            }
         };
 
         match self.state.db.get_all_public_keys().await {
@@ -129,7 +134,10 @@ impl russh::server::Handler for GitSession {
             Err(e) => tracing::error!("SSH auth: db error: {e}"),
         }
         tracing::warn!("SSH auth: rejected for user={user}");
-        Ok(russh::server::Auth::Reject { proceed_with_methods: None, partial_success: false })
+        Ok(russh::server::Auth::Reject {
+            proceed_with_methods: None,
+            partial_success: false,
+        })
     }
 
     async fn auth_password(
@@ -138,7 +146,10 @@ impl russh::server::Handler for GitSession {
         _password: &str,
     ) -> Result<russh::server::Auth, Self::Error> {
         // Password auth is disabled — only registered public keys are accepted.
-        Ok(russh::server::Auth::Reject { proceed_with_methods: None, partial_success: false })
+        Ok(russh::server::Auth::Reject {
+            proceed_with_methods: None,
+            partial_success: false,
+        })
     }
 
     async fn channel_open_session(
@@ -162,21 +173,45 @@ impl russh::server::Handler for GitSession {
         tracing::debug!("SSH exec: {cmd}");
 
         let Some((command, repo_path)) = parse_git_command(&cmd) else {
-            session.data(channel_id, Vec::from(b"unsupported command\n" as &[u8]))?;
+            session.extended_data(channel_id, 1, Vec::from(b"unsupported command\n" as &[u8]))?;
             session.close(channel_id)?;
             return Ok(());
         };
 
         let Some((owner, repo_name)) = parse_owner_repo(&repo_path) else {
-            session.data(channel_id, Vec::from(b"invalid repository path\n" as &[u8]))?;
+            session.extended_data(
+                channel_id,
+                1,
+                Vec::from(b"invalid repository path\n" as &[u8]),
+            )?;
             session.close(channel_id)?;
             return Ok(());
         };
 
+        // Private repos: only owner and space members may clone/fetch.
+        if command == "git-upload-pack"
+            && crate::auth::assert_read_auth(
+                &self.state,
+                &owner,
+                &repo_name,
+                self.auth_did.as_deref(),
+            )
+            .await
+            .is_err()
+        {
+            session.extended_data(channel_id, 1, Vec::from(b"repository not found\n" as &[u8]))?;
+            session.close(channel_id)?;
+            return Ok(());
+        }
+
         // Pushes require ownership: the authenticated DID must own the repo.
         if command == "git-receive-pack" {
             let Some(ref did) = self.auth_did else {
-                session.data(channel_id, Vec::from(b"authentication required\n" as &[u8]))?;
+                session.extended_data(
+                    channel_id,
+                    1,
+                    Vec::from(b"authentication required\n" as &[u8]),
+                )?;
                 session.close(channel_id)?;
                 return Ok(());
             };
@@ -185,8 +220,9 @@ impl russh::server::Handler for GitSession {
                 .is_err()
             {
                 tracing::warn!("SSH push denied: {did} -> {owner}/{repo_name}");
-                session.data(
+                session.extended_data(
                     channel_id,
+                    1,
                     format!("push denied: not authorized for {owner}/{repo_name}\n").into_bytes(),
                 )?;
                 session.close(channel_id)?;
@@ -195,7 +231,7 @@ impl russh::server::Handler for GitSession {
         }
 
         let Some(repo_path) = resolve_repo_path(&self.state, &owner, &repo_name).await else {
-            session.data(channel_id, Vec::from(b"repository not found\n" as &[u8]))?;
+            session.extended_data(channel_id, 1, Vec::from(b"repository not found\n" as &[u8]))?;
             session.close(channel_id)?;
             return Ok(());
         };
@@ -396,7 +432,11 @@ async fn read_receive_pack_request<R: AsyncReadExt + Unpin>(
         }
         buf.extend_from_slice(&tmp[..n]);
         if buf.len() > max_bytes {
-            anyhow::bail!("git request too large: {} bytes (max {})", buf.len(), max_bytes);
+            anyhow::bail!(
+                "git request too large: {} bytes (max {})",
+                buf.len(),
+                max_bytes
+            );
         }
 
         // Check if we've seen a flush packet at a pkt-line boundary.

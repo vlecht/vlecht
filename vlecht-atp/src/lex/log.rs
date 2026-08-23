@@ -1,4 +1,5 @@
 use crate::error::XrpcError;
+use crate::lex::maybe_auth::OptionalDid;
 use crate::lex::resolve::resolve_repo_path;
 use crate::lex::LexState;
 use axum::extract::{Query, State};
@@ -26,9 +27,10 @@ pub struct Params {
 
 pub async fn handler(
     State(state): State<LexState>,
+    auth: OptionalDid,
     Query(p): Query<Params>,
 ) -> Result<Json<Value>, XrpcError> {
-    let path = resolve_repo_path(&state, &p.repo).await?;
+    let path = resolve_repo_path(&state, &p.repo, auth.0.as_deref()).await?;
     let repo = GitRepo::open(&path).map_err(|e| XrpcError::InternalServerError(e.to_string()))?;
 
     let ref_name = p

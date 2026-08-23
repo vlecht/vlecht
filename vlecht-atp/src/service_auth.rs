@@ -28,9 +28,5 @@ pub fn build_service_auth_config(
     // jti replay protection is disabled: `jti` is optional in the atproto
     // service-auth spec, and the Go knotserver accepts tokens without one.
     // Requiring jti would break drop-in interop with clients that omit it.
-    Some(ServiceAuthConfig::new(
-        audience,
-        id.resolver.as_ref().clone(),
-    )
-    .disable_replay_protection())
+    Some(ServiceAuthConfig::new(audience, id.resolver.as_ref().clone()).disable_replay_protection())
 }

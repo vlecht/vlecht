@@ -1,4 +1,4 @@
-use crate::auth::{assert_push_auth, Did};
+use crate::auth::{assert_push_auth, assert_read_auth, Did, MaybeDid};
 use crate::AppState;
 use axum::{
     body::Body,
@@ -92,7 +92,9 @@ pub async fn info_refs(
     State(state): State<Arc<AppState>>,
     Path((owner, repo)): Path<(String, String)>,
     Query(params): Query<InfoRefsParams>,
+    auth: MaybeDid,
 ) -> Result<Response, StatusCode> {
+    assert_read_auth(&state, &owner, &repo, auth.0.as_deref()).await?;
     let git_repo = open_repo(&state, &owner, &repo).await?;
 
     match params.service.as_deref() {
@@ -137,9 +139,11 @@ pub async fn info_refs(
 pub async fn upload_pack(
     State(state): State<Arc<AppState>>,
     Path((owner, repo)): Path<(String, String)>,
+    auth: MaybeDid,
     headers: http::HeaderMap,
     body: axum::body::Bytes,
 ) -> Result<Response, StatusCode> {
+    assert_read_auth(&state, &owner, &repo, auth.0.as_deref()).await?;
     let git_repo = open_repo(&state, &owner, &repo).await?;
     let decompressed = maybe_decompress(&headers, &body);
 
@@ -159,7 +163,9 @@ pub async fn upload_pack(
 pub async fn branches(
     State(state): State<Arc<AppState>>,
     Path((owner, repo)): Path<(String, String)>,
+    auth: MaybeDid,
 ) -> Result<Response, StatusCode> {
+    assert_read_auth(&state, &owner, &repo, auth.0.as_deref()).await?;
     let git_repo = open_repo(&state, &owner, &repo).await?;
     let branches = git_repo
         .branches()
@@ -170,7 +176,9 @@ pub async fn branches(
 pub async fn tags(
     State(state): State<Arc<AppState>>,
     Path((owner, repo)): Path<(String, String)>,
+    auth: MaybeDid,
 ) -> Result<Response, StatusCode> {
+    assert_read_auth(&state, &owner, &repo, auth.0.as_deref()).await?;
     let git_repo = open_repo(&state, &owner, &repo).await?;
     let tags = git_repo
         .tags()
@@ -197,7 +205,9 @@ pub async fn log(
     State(state): State<Arc<AppState>>,
     Path((owner, repo, refname)): Path<(String, String, String)>,
     Query(params): Query<LogParams>,
+    auth: MaybeDid,
 ) -> Result<Response, StatusCode> {
+    assert_read_auth(&state, &owner, &repo, auth.0.as_deref()).await?;
     let git_repo = open_repo(&state, &owner, &repo).await?;
 
     let ref_name = if refname.is_empty() {
@@ -216,14 +226,18 @@ pub async fn log(
 pub async fn tree_root(
     State(state): State<Arc<AppState>>,
     Path((owner, repo)): Path<(String, String)>,
+    auth: MaybeDid,
 ) -> Result<Response, StatusCode> {
+    assert_read_auth(&state, &owner, &repo, auth.0.as_deref()).await?;
     tree_inner(&state, &owner, &repo, "").await
 }
 
 pub async fn tree_at(
     State(state): State<Arc<AppState>>,
     Path((owner, repo, path)): Path<(String, String, String)>,
+    auth: MaybeDid,
 ) -> Result<Response, StatusCode> {
+    assert_read_auth(&state, &owner, &repo, auth.0.as_deref()).await?;
     tree_inner(&state, &owner, &repo, &path).await
 }
 
@@ -252,7 +266,9 @@ async fn tree_inner(
 pub async fn blob(
     State(state): State<Arc<AppState>>,
     Path((owner, repo, path)): Path<(String, String, String)>,
+    auth: MaybeDid,
 ) -> Result<Response, StatusCode> {
+    assert_read_auth(&state, &owner, &repo, auth.0.as_deref()).await?;
     let git_repo = open_repo(&state, &owner, &repo).await?;
 
     let ref_name = git_repo.default_branch().unwrap_or_else(|_| "HEAD".into());
@@ -273,7 +289,9 @@ pub async fn blob(
 pub async fn diff(
     State(state): State<Arc<AppState>>,
     Path((owner, repo, refname)): Path<(String, String, String)>,
+    auth: MaybeDid,
 ) -> Result<Response, StatusCode> {
+    assert_read_auth(&state, &owner, &repo, auth.0.as_deref()).await?;
     let git_repo = open_repo(&state, &owner, &repo).await?;
 
     let head = if refname.is_empty() {
@@ -310,7 +328,9 @@ pub async fn archive(
     State(state): State<Arc<AppState>>,
     Path((owner, repo)): Path<(String, String)>,
     Query(params): Query<ArchiveParams>,
+    auth: MaybeDid,
 ) -> Result<Response, StatusCode> {
+    assert_read_auth(&state, &owner, &repo, auth.0.as_deref()).await?;
     let git_repo = open_repo(&state, &owner, &repo).await?;
 
     let (content_type, format) = match params.format.as_str() {
@@ -369,6 +389,8 @@ pub struct CreateRepoBody {
     pub owner: String,
     pub name: String,
     pub default_branch: Option<String>,
+    /// Optional initial visibility (`"public"` or `"private"`).
+    pub visibility: Option<String>,
 }
 
 pub async fn create_repo(
@@ -387,6 +409,12 @@ pub async fn create_repo(
         return Err(StatusCode::FORBIDDEN);
     }
 
+    if let Some(vis) = body.visibility.as_deref() {
+        if vis != "public" && vis != "private" {
+            return Err(StatusCode::BAD_REQUEST);
+        }
+    }
+
     let default_branch = body.default_branch.as_deref().unwrap_or("main");
     let repo_path = join_safe(&state.cfg.repo_scan_path, &[&body.owner, &body.name])
         .ok_or(StatusCode::BAD_REQUEST)?;
@@ -401,9 +429,10 @@ pub async fn create_repo(
     GitRepo::init_bare(&repo_path, default_branch)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    // Track in database: create an alias for it
-    // Use a simple fake DID for MVP — in production this comes from auth
+    // Track in database: deterministic repo DID (same derivation as the
+    // XRPC create endpoint) so visibility/membership keys are per-repo.
     let owner_did = format!("did:plc:{}", body.owner);
+    let repo_did = vlecht_atp::lex::derive_repo_did(&owner_did, &body.name);
     state
         .db
         .add_did(&owner_did)
@@ -411,9 +440,17 @@ pub async fn create_repo(
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     state
         .db
-        .create_repo(&owner_did, None, &owner_did, &body.name, "k256")
+        .create_repo(&repo_did, None, &owner_did, &body.name, "k256")
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    if let Some(vis) = body.visibility.as_deref() {
+        state
+            .db
+            .set_repo_visibility(&repo_did, vis)
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    }
 
     tracing::info!("created repo {}/{}", body.owner, body.name);
 

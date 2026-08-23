@@ -37,12 +37,11 @@ pub async fn handler(
             .unwrap_or("unknown")
     });
 
-    let repo_did =
-        assert_owns_by_name(&state, &actor_did, &body.did, repo_name).await?;
+    let repo_did = assert_owns_by_name(&state, &actor_did, &body.did, repo_name).await?;
 
-    let repo_path = resolve_repo_path(&state, &repo_did).await?;
-    let repo = GitRepo::open(&repo_path)
-        .map_err(|e| XrpcError::InternalServerError(e.to_string()))?;
+    let repo_path = resolve_repo_path(&state, &repo_did, Some(&actor_did)).await?;
+    let repo =
+        GitRepo::open(&repo_path).map_err(|e| XrpcError::InternalServerError(e.to_string()))?;
 
     let fork_oid = repo
         .resolve_ref(&body.branch)

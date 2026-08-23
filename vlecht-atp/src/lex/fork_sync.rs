@@ -26,12 +26,11 @@ pub async fn handler(
     MaybeAuth(actor_did): MaybeAuth,
     Json(body): Json<Input>,
 ) -> Result<Json<Value>, XrpcError> {
-    let repo_did =
-        assert_owns_by_name(&state, &actor_did, &body.did, &body.name).await?;
+    let repo_did = assert_owns_by_name(&state, &actor_did, &body.did, &body.name).await?;
 
-    let repo_path = resolve_repo_path(&state, &repo_did).await?;
-    let repo = GitRepo::open(&repo_path)
-        .map_err(|e| XrpcError::InternalServerError(e.to_string()))?;
+    let repo_path = resolve_repo_path(&state, &repo_did, Some(&actor_did)).await?;
+    let repo =
+        GitRepo::open(&repo_path).map_err(|e| XrpcError::InternalServerError(e.to_string()))?;
 
     // Fast-forward the branch to the hidden upstream ref. The hidden ref
     // name is supplied by the client (set via hiddenRef), so forkSync and
@@ -39,9 +38,7 @@ pub async fn handler(
     let upstream = repo
         .get_hidden_ref(&body.hidden_ref)
         .map_err(|e| XrpcError::InternalServerError(e.to_string()))?
-        .ok_or_else(|| {
-            XrpcError::RefNotFound(format!("hidden ref: {}", body.hidden_ref))
-        })?;
+        .ok_or_else(|| XrpcError::RefNotFound(format!("hidden ref: {}", body.hidden_ref)))?;
 
     // Check if this is a fast-forward
     let can_ff = repo

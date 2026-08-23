@@ -22,9 +22,7 @@ pub async fn assert_owns_by_name(
     name: &str,
 ) -> Result<String, XrpcError> {
     if actor_did != owner_did {
-        tracing::warn!(
-            "authz: {actor_did} denied write to {owner_did}/{name} (not owner)"
-        );
+        tracing::warn!("authz: {actor_did} denied write to {owner_did}/{name} (not owner)");
         return Err(XrpcError::Unauthorized);
     }
     state

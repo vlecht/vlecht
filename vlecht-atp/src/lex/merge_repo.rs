@@ -41,12 +41,11 @@ pub async fn handler(
     MaybeAuth(actor_did): MaybeAuth,
     Json(body): Json<Input>,
 ) -> Result<(StatusCode, Json<Value>), XrpcError> {
-    let repo_did =
-        assert_owns_by_name(&state, &actor_did, &body.did, &body.name).await?;
+    let repo_did = assert_owns_by_name(&state, &actor_did, &body.did, &body.name).await?;
 
-    let repo_path = resolve_repo_path(&state, &repo_did).await?;
-    let repo = GitRepo::open(&repo_path)
-        .map_err(|e| XrpcError::InternalServerError(e.to_string()))?;
+    let repo_path = resolve_repo_path(&state, &repo_did, Some(&actor_did)).await?;
+    let repo =
+        GitRepo::open(&repo_path).map_err(|e| XrpcError::InternalServerError(e.to_string()))?;
 
     let default_branch = repo.default_branch().unwrap_or_else(|_| "main".into());
     let target_branch = &body.branch;

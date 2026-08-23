@@ -1,4 +1,5 @@
 use crate::error::XrpcError;
+use crate::lex::maybe_auth::OptionalDid;
 use crate::lex::resolve::resolve_repo_path;
 use crate::lex::LexState;
 use axum::extract::{Query, State};
@@ -21,9 +22,10 @@ pub struct Params {
 
 pub async fn handler(
     State(state): State<LexState>,
+    auth: OptionalDid,
     Query(p): Query<Params>,
 ) -> Result<Json<Value>, XrpcError> {
-    let path = resolve_repo_path(&state, &p.repo).await?;
+    let path = resolve_repo_path(&state, &p.repo, auth.0.as_deref()).await?;
     let repo = GitRepo::open(&path).map_err(|e| XrpcError::InternalServerError(e.to_string()))?;
 
     let ref_name = p
@@ -82,11 +84,11 @@ pub async fn handler(
         })
         .collect();
 
-        let last_commit = files
-            .iter()
-            .filter_map(|f| f.get("last_commit"))
-            .max_by_key(|lc| lc["when"].as_str().unwrap_or("").to_string());
-        let last_commit = last_commit.map(Clone::clone);
+    let last_commit = files
+        .iter()
+        .filter_map(|f| f.get("last_commit"))
+        .max_by_key(|lc| lc["when"].as_str().unwrap_or("").to_string());
+    let last_commit = last_commit.map(Clone::clone);
 
     let parent = tree_path.map(|s| s.to_string());
     let dotdot = tree_path.and_then(|s| {
@@ -123,13 +125,20 @@ pub async fn handler(
 /// Checks file name (case-insensitive) and mode (must be a blob).
 fn readme_filename(entries: &[vlecht_git::TreeEntry]) -> String {
     let candidates = [
-        "README.md", "readme.md",
-        "README", "readme",
-        "README.markdown", "readme.markdown",
-        "README.txt", "readme.txt",
-        "README.rst", "readme.rst",
-        "README.org", "readme.org",
-        "README.asciidoc", "readme.asciidoc",
+        "README.md",
+        "readme.md",
+        "README",
+        "readme",
+        "README.markdown",
+        "readme.markdown",
+        "README.txt",
+        "readme.txt",
+        "README.rst",
+        "readme.rst",
+        "README.org",
+        "readme.org",
+        "README.asciidoc",
+        "readme.asciidoc",
     ];
     for entry in entries {
         if entry.kind == EntryKindSnapshot::Blob {

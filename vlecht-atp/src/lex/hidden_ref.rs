@@ -27,9 +27,9 @@ pub async fn handler(
     Json(body): Json<Input>,
 ) -> Result<Json<Value>, XrpcError> {
     let _repo_did = assert_owns_by_repo(&state, &actor_did, &body.repo).await?;
-    let repo_path = resolve_repo_path(&state, &body.repo).await?;
-    let repo = GitRepo::open(&repo_path)
-        .map_err(|e| XrpcError::InternalServerError(e.to_string()))?;
+    let repo_path = resolve_repo_path(&state, &body.repo, Some(&actor_did)).await?;
+    let repo =
+        GitRepo::open(&repo_path).map_err(|e| XrpcError::InternalServerError(e.to_string()))?;
 
     // Resolve the remote ref to an OID. If it can't be resolved, return an
     // error — set_hidden_ref requires a valid OID, and storing a raw ref

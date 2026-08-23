@@ -1,4 +1,5 @@
 use crate::error::XrpcError;
+use crate::lex::maybe_auth::OptionalDid;
 use crate::lex::resolve::resolve_repo_path;
 use crate::lex::LexState;
 use axum::extract::State;
@@ -22,6 +23,7 @@ pub struct Input {
 
 pub async fn handler(
     State(state): State<LexState>,
+    auth: OptionalDid,
     Json(body): Json<Input>,
 ) -> Result<Json<Value>, XrpcError> {
     // Resolve repo from did+name
@@ -31,9 +33,9 @@ pub async fn handler(
         .await
         .map_err(|_| XrpcError::RepoNotFound(format!("{}/{}", body.did, body.name)))?;
 
-    let repo_path = resolve_repo_path(&state, &repo_did).await?;
-    let repo = GitRepo::open(&repo_path)
-        .map_err(|e| XrpcError::InternalServerError(e.to_string()))?;
+    let repo_path = resolve_repo_path(&state, &repo_did, auth.0.as_deref()).await?;
+    let repo =
+        GitRepo::open(&repo_path).map_err(|e| XrpcError::InternalServerError(e.to_string()))?;
 
     let default_branch = repo.default_branch().unwrap_or_else(|_| "main".into());
     let target = &body.branch;
@@ -50,9 +52,7 @@ pub async fn handler(
     let mut conflicts: Vec<Value> = Vec::new();
 
     if merge_base.is_some() {
-        let head_is_ancestor = repo
-            .is_ancestor(target, &default_branch)
-            .unwrap_or(false);
+        let head_is_ancestor = repo.is_ancestor(target, &default_branch).unwrap_or(false);
 
         if head_is_ancestor {
             // Target is behind head — up to date, no conflict

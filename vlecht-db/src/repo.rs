@@ -38,3 +38,16 @@ pub struct KnotMember {
     pub subject: String,
     pub created: String,
 }
+
+/// A row in `repo_members` — a member of a repo's space.
+///
+/// `role` is `reader` (clone/fetch) or `writer` (additionally push; this
+/// is what the Go knotserver calls a collaborator).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RepoMember {
+    pub repo_did: String,
+    pub member_did: String,
+    pub role: String,
+    pub added_by: Option<String>,
+    pub created: String,
+}

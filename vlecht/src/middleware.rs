@@ -1,10 +1,10 @@
+use axum::body::Body;
 use axum::http::header;
+use axum::http::Request;
 use axum::middleware::Next;
 use axum::response::Response;
 use std::time::Instant;
 use tracing::info;
-use axum::body::Body;
-use axum::http::Request;
 
 /// CORS middleware matching the Go knotserver's `middleware.go:37-53`.
 pub async fn cors_middleware(req: Request<Body>, next: Next) -> Response {
@@ -19,10 +19,7 @@ pub async fn cors_middleware(req: Request<Body>, next: Next) -> Response {
         header::ACCESS_CONTROL_ALLOW_HEADERS,
         "Content-Type, Authorization".parse().unwrap(),
     );
-    headers.insert(
-        header::ACCESS_CONTROL_MAX_AGE,
-        "86400".parse().unwrap(),
-    );
+    headers.insert(header::ACCESS_CONTROL_MAX_AGE, "86400".parse().unwrap());
     response
 }
 

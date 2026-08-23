@@ -51,11 +51,10 @@ impl AtpConfig {
     /// format) and constructs a `did:web` DID document with a single
     /// `verificationMethod` entry. Returns `None` if ATproto is not
     /// enabled (missing audience DID or key file).
-    pub fn build_did_document(&self) -> Option<
-        jacquard_common::types::did_doc::DidDocument<
-            jacquard_common::CowStr<'static>,
-        >,
-    > {
+    pub fn build_did_document(
+        &self,
+    ) -> Option<jacquard_common::types::did_doc::DidDocument<jacquard_common::CowStr<'static>>>
+    {
         use jacquard_common::types::did_doc::{DidDocument, VerificationMethod};
         use jacquard_common::CowStr;
 
@@ -79,8 +78,7 @@ impl AtpConfig {
 
         let doc = DidDocument {
             context: jacquard_common::types::did_doc::default_context(),
-            id: jacquard_common::types::string::Did::new_owned(&audience)
-                .ok()?,
+            id: jacquard_common::types::string::Did::new_owned(&audience).ok()?,
             also_known_as: None,
             verification_method: Some(vec![VerificationMethod {
                 id: CowStr::copy_from_str(&vm_id),

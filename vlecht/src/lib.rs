@@ -19,8 +19,7 @@ pub struct AppState {
     pub atp: Arc<vlecht_atp::lex::LexState>,
     /// Service auth config for XRPC write endpoints. None when ATproto is
     /// disabled (write endpoints return 401).
-    pub atp_service_auth:
-        Arc<Option<vlecht_atp::ServiceAuthConfig<vlecht_atp::PublicResolver>>>,
+    pub atp_service_auth: Arc<Option<vlecht_atp::ServiceAuthConfig<vlecht_atp::PublicResolver>>>,
 }
 
 /// Build the application router with all routes and state.
@@ -72,7 +71,10 @@ pub fn build_app(state: Arc<AppState>) -> Router {
     // Only active when ATproto is enabled (audience DID + key file set).
     // Auto-derives audience DID from hostname like the Go server.
     let mut atp_config = vlecht_atp::config::AtpConfig::from_env();
-    if atp_config.audience_did.is_empty() && !state.cfg.hostname.is_empty() && state.cfg.hostname != "localhost" {
+    if atp_config.audience_did.is_empty()
+        && !state.cfg.hostname.is_empty()
+        && state.cfg.hostname != "localhost"
+    {
         atp_config.audience_did = format!("did:web:{}", state.cfg.hostname);
     }
     let did_doc = atp_config.build_did_document();
@@ -112,7 +114,8 @@ pub fn build_state(db: Db, cfg: Arc<config::Config>) -> Arc<AppState> {
     // Auto-derive audience DID from hostname (matching Go knotserver behavior).
     // The Go server uses `did:web:<hostname>` as the service's own DID for
     // service auth audience validation. Only applied if VLECHT_ATP_AUDIENCE_DID is unset.
-    if atp_config.audience_did.is_empty() && !cfg.hostname.is_empty() && cfg.hostname != "localhost" {
+    if atp_config.audience_did.is_empty() && !cfg.hostname.is_empty() && cfg.hostname != "localhost"
+    {
         atp_config.audience_did = format!("did:web:{}", cfg.hostname);
     }
     let identity = match vlecht_atp::identity::AtpIdentity::new(&atp_config) {
@@ -137,6 +140,7 @@ pub fn build_state(db: Db, cfg: Arc<config::Config>) -> Arc<AppState> {
             .or_else(|_| std::env::var("VLECHT_ATP_OWNER_DID"))
             .unwrap_or_default(),
         repo_scan_path: cfg.repo_scan_path.clone(),
+        audience_did: atp_config.audience_did.clone(),
     };
 
     Arc::new(AppState {

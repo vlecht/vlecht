@@ -170,9 +170,16 @@ fn branches_lists_main() {
     let (repo, dir) = setup_repo("branches_lists_main", "main");
     let branches = repo.branches().unwrap();
     assert!(branches.iter().any(|b| b.name == "main" && b.is_default));
-    assert!(branches.iter().any(|b| b.name == "feature" && !b.is_default));
+    assert!(branches
+        .iter()
+        .any(|b| b.name == "feature" && !b.is_default));
     for b in &branches {
-        assert_eq!(b.target.len(), 40, "branch {} has invalid target length", b.name);
+        assert_eq!(
+            b.target.len(),
+            40,
+            "branch {} has invalid target length",
+            b.name
+        );
     }
     cleanup(&dir);
 }
@@ -368,9 +375,7 @@ fn diff_main_against_main_is_empty() {
 #[test]
 fn archive_targz_is_nonempty_and_gzipped() {
     let (repo, dir) = setup_repo("archive_tgz", "main");
-    let bytes = repo
-        .archive("main", ArchiveFormat::TarGz, "repo/")
-        .unwrap();
+    let bytes = repo.archive("main", ArchiveFormat::TarGz, "repo/").unwrap();
     assert!(!bytes.is_empty());
     assert_eq!(&bytes[..2], &[0x1f, 0x8b]);
     cleanup(&dir);
@@ -379,9 +384,7 @@ fn archive_targz_is_nonempty_and_gzipped() {
 #[test]
 fn archive_zip_is_nonempty_and_has_zip_signature() {
     let (repo, dir) = setup_repo("archive_zip", "main");
-    let bytes = repo
-        .archive("main", ArchiveFormat::Zip, "repo/")
-        .unwrap();
+    let bytes = repo.archive("main", ArchiveFormat::Zip, "repo/").unwrap();
     assert!(!bytes.is_empty());
     assert_eq!(&bytes[..4], b"PK\x03\x04");
     cleanup(&dir);

@@ -19,6 +19,10 @@ pub struct Input {
     pub rkey: String,
     #[serde(default)]
     pub default_branch: Option<String>,
+    /// Optional initial visibility (`"public"` or `"private"`).
+    /// Defaults to public.
+    #[serde(default)]
+    pub visibility: Option<String>,
 }
 
 pub async fn handler(
@@ -28,24 +32,19 @@ pub async fn handler(
 ) -> Result<Json<Value>, XrpcError> {
     let default_branch = body.default_branch.as_deref().unwrap_or("main");
 
+    if let Some(vis) = body.visibility.as_deref() {
+        if vis != "public" && vis != "private" {
+            return Err(XrpcError::InvalidRequest(
+                "visibility must be \"public\" or \"private\"".into(),
+            ));
+        }
+    }
+
     // Validate repo name + rkey (rkey becomes a path segment — must be safe).
     validate_repo_name(&body.name)?;
     validate_repo_name(&body.rkey)?;
 
-    // Generate a deterministic repo DID from the owner DID + rkey.
-    // In production, the Go server registers a real did:plc with the PLC
-    // directory. Vlecht (MVP) generates a synthetic but deterministic DID
-    // by hashing owner_did + ":" + rkey — collision-free and stable across
-    // restarts, though not a real PLC-registered DID.
-    let repo_did = {
-        use sha2::Digest;
-        let mut hasher = sha2::Sha256::new();
-        hasher.update(actor_did.as_bytes());
-        hasher.update(b":");
-        hasher.update(body.rkey.as_bytes());
-        let hash = hasher.finalize();
-        format!("did:plc:{}", hex::encode(&hash[..16]))
-    };
+    let repo_did = super::derive_repo_did(&actor_did, &body.rkey);
 
     // Check if repo already exists (by rkey — same as Go's primary check)
     if state
@@ -71,8 +70,7 @@ pub async fn handler(
     let parent = repo_path
         .parent()
         .ok_or_else(|| XrpcError::InvalidRequest("invalid repository path".into()))?;
-    std::fs::create_dir_all(parent)
-        .map_err(|e| XrpcError::InternalServerError(e.to_string()))?;
+    std::fs::create_dir_all(parent).map_err(|e| XrpcError::InternalServerError(e.to_string()))?;
 
     GitRepo::init_bare(&repo_path, default_branch)
         .map_err(|e| XrpcError::InternalServerError(e.to_string()))?;
@@ -83,6 +81,14 @@ pub async fn handler(
         .create_repo(&repo_did, None, &actor_did, &body.rkey, "k256")
         .await
         .map_err(|e| XrpcError::InternalServerError(e.to_string()))?;
+
+    if let Some(vis) = body.visibility.as_deref() {
+        state
+            .db
+            .set_repo_visibility(&repo_did, vis)
+            .await
+            .map_err(|e| XrpcError::InternalServerError(e.to_string()))?;
+    }
 
     Ok(Json(json!({ "repoDid": repo_did })))
 }
@@ -105,9 +111,7 @@ fn validate_repo_name(name: &str) -> Result<(), XrpcError> {
         ));
     }
     // check for sequences that could be used for traversal when normalized
-    if name.contains("./") || name.contains("../")
-        || name.starts_with('.') || name.ends_with('.')
-    {
+    if name.contains("./") || name.contains("../") || name.starts_with('.') || name.ends_with('.') {
         return Err(XrpcError::InvalidRequest(
             "repository name contains invalid path sequence".into(),
         ));

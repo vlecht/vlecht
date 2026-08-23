@@ -1,4 +1,5 @@
 use crate::error::XrpcError;
+use crate::lex::maybe_auth::OptionalDid;
 use crate::lex::resolve::resolve_repo_path;
 use crate::lex::LexState;
 use axum::body::Body;
@@ -28,9 +29,10 @@ fn default_format() -> String {
 
 pub async fn handler(
     State(state): State<LexState>,
+    auth: OptionalDid,
     Query(p): Query<Params>,
 ) -> Result<Response, XrpcError> {
-    let path = resolve_repo_path(&state, &p.repo).await?;
+    let path = resolve_repo_path(&state, &p.repo, auth.0.as_deref()).await?;
     let repo = GitRepo::open(&path).map_err(|e| XrpcError::InternalServerError(e.to_string()))?;
 
     let (content_type, format) = match p.format.as_str() {
@@ -75,7 +77,10 @@ pub async fn handler(
             header::CONTENT_DISPOSITION,
             format!("attachment; filename=\"{}\"", filename),
         )
-        .header(header::LINK, format!("<{}>; rel=\"immutable\"", immutable_link))
+        .header(
+            header::LINK,
+            format!("<{}>; rel=\"immutable\"", immutable_link),
+        )
         .body(Body::from(bytes))
         .unwrap())
 }

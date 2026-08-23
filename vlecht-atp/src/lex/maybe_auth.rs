@@ -20,6 +20,28 @@ use serde_json::{json, Value};
 #[derive(Debug, Clone)]
 pub struct MaybeAuth(pub String);
 
+/// Truly-optional DID extraction for read endpoints.
+///
+/// Never rejects. Anonymous callers get `OptionalDid(None)`; callers whose
+/// service-auth token passed the optional auth layer get `OptionalDid(Some(did))`.
+#[derive(Debug, Clone)]
+pub struct OptionalDid(pub Option<String>);
+
+impl FromRequestParts<LexState> for OptionalDid {
+    type Rejection = std::convert::Infallible;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        _state: &LexState,
+    ) -> Result<Self, Self::Rejection> {
+        let did = parts
+            .extensions
+            .get::<VerifiedServiceAuth<'static>>()
+            .map(|auth| auth.did().to_string());
+        Ok(OptionalDid(did))
+    }
+}
+
 impl FromRequestParts<LexState> for MaybeAuth {
     type Rejection = (StatusCode, Json<Value>);
 

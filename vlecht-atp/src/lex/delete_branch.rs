@@ -24,9 +24,9 @@ pub async fn handler(
     Json(body): Json<Input>,
 ) -> Result<Json<Value>, XrpcError> {
     let _repo_did = assert_owns_by_repo(&state, &actor_did, &body.repo).await?;
-    let repo_path = resolve_repo_path(&state, &body.repo).await?;
-    let repo = GitRepo::open(&repo_path)
-        .map_err(|e| XrpcError::InternalServerError(e.to_string()))?;
+    let repo_path = resolve_repo_path(&state, &body.repo, Some(&actor_did)).await?;
+    let repo =
+        GitRepo::open(&repo_path).map_err(|e| XrpcError::InternalServerError(e.to_string()))?;
 
     // Don't allow deleting the default branch
     let default = repo.default_branch().unwrap_or_default();

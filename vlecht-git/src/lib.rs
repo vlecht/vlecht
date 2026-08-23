@@ -263,7 +263,8 @@ impl GitRepo {
         let commit = spec.object()?.try_into_commit()?;
         let tree = commit.tree()?;
 
-        let mut lang_sizes: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+        let mut lang_sizes: std::collections::HashMap<String, u64> =
+            std::collections::HashMap::new();
         let mut total_size: u64 = 0;
         let mut total_files: u64 = 0;
 
@@ -389,10 +390,7 @@ impl GitRepo {
             }
         }
 
-        Err(GitError::Gix(format!(
-            "no commit found for path {}",
-            path
-        )))
+        Err(GitError::Gix(format!("no commit found for path {}", path)))
     }
 
     /// Read the submodule URL from .gitmodules for a given path.
@@ -408,7 +406,9 @@ impl GitRepo {
         };
 
         let modules_entry = tree.lookup_entry([".gitmodules"])?;
-        let Some(entry) = modules_entry else { return Ok(None) };
+        let Some(entry) = modules_entry else {
+            return Ok(None);
+        };
         let blob = entry.object()?.try_into_blob()?;
         let content = String::from_utf8_lossy(&blob.data);
 
@@ -566,10 +566,7 @@ impl GitRepo {
                     "receive_pack: rejecting ref update to disallowed namespace: {}",
                     cmd.refname
                 );
-                reports.push(format!(
-                    "ng {} ref namespace not allowed\n",
-                    cmd.refname
-                ));
+                reports.push(format!("ng {} ref namespace not allowed\n", cmd.refname));
                 continue;
             }
 
@@ -681,12 +678,11 @@ impl GitRepo {
         .map_err(|e| GitError::Gix(format!("re-parse: {e}")))?;
 
         // Resolve ref-deltas again since we need the resolved objects
-        let resolve_iter2 =
-            gix_pack::data::input::LookupRefDeltaObjectsIter::new(
-                pack_iter2,
-                &self.inner,
-                gix_zlib::Compression::default(),
-            );
+        let resolve_iter2 = gix_pack::data::input::LookupRefDeltaObjectsIter::new(
+            pack_iter2,
+            &self.inner,
+            gix_zlib::Compression::default(),
+        );
 
         for entry_result in resolve_iter2 {
             let entry = entry_result.map_err(|e| GitError::Gix(format!("entry: {e}")))?;
@@ -776,8 +772,8 @@ impl GitRepo {
 
     /// Set the default branch by updating HEAD to point to a new branch.
     pub fn set_default_branch(&self, branch: &str) -> Result<(), GitError> {
-        use gix::refs::{Category, FullName, Target};
         use gix::refs::transaction::{Change, PreviousValue, RefEdit};
+        use gix::refs::{Category, FullName, Target};
 
         let sym_ref: FullName =
             Category::LocalBranch.to_full_name(gix::bstr::BString::from(branch).as_bstr())?;
@@ -789,8 +785,7 @@ impl GitRepo {
                 expected: PreviousValue::Any,
                 new: Target::Symbolic(sym_ref),
             },
-            name: FullName::try_from("HEAD")
-                .map_err(|e| GitError::Gix(e.to_string()))?,
+            name: FullName::try_from("HEAD").map_err(|e| GitError::Gix(e.to_string()))?,
             deref: false,
         };
         self.inner.edit_reference(edit)?;
@@ -801,8 +796,8 @@ impl GitRepo {
     /// or didn't exist. Returns an error for genuine failures (lock issues,
     /// I/O errors, invalid branch name).
     pub fn delete_branch(&self, branch: &str) -> Result<(), GitError> {
-        use gix::refs::{Category, FullName};
         use gix::refs::transaction::{Change, PreviousValue, RefEdit};
+        use gix::refs::{Category, FullName};
 
         let full_name: FullName =
             Category::LocalBranch.to_full_name(gix::bstr::BString::from(branch).as_bstr())?;
@@ -869,8 +864,8 @@ impl GitRepo {
 
     /// Update a branch ref to point to a new commit (fast-forward).
     pub fn fast_forward_ref(&self, branch: &str, target_commit: &str) -> Result<(), GitError> {
-        use gix::refs::{Category, FullName};
         use gix::refs::transaction::{Change, PreviousValue, RefEdit};
+        use gix::refs::{Category, FullName};
 
         let target = gix::hash::ObjectId::from_hex(target_commit.as_bytes())
             .map_err(|e| GitError::Gix(e.to_string()))?;
@@ -1144,8 +1139,9 @@ impl UploadPackRequest {
                 continue;
             }
             let payload = &body[pos + 4..pos + len];
-            let line = std::str::from_utf8(payload)
-                .map_err(|_| GitError::Protocol("non-utf8 pkt-line in upload-pack request".into()))?;
+            let line = std::str::from_utf8(payload).map_err(|_| {
+                GitError::Protocol("non-utf8 pkt-line in upload-pack request".into())
+            })?;
             let line = line.trim_end_matches('\n');
 
             if line == "done" {
@@ -1250,7 +1246,7 @@ fn generate_pack_bytes(
             &data,
             gix_zlib::Compression::default(),
         )
-            .map_err(|e| GitError::Gix(format!("pack entry: {e}")))?;
+        .map_err(|e| GitError::Gix(format!("pack entry: {e}")))?;
         entries.push(entry);
     }
 

@@ -1,7 +1,7 @@
 use crate::AppState;
 use axum::{
-    extract::{Request, State},
-    http::StatusCode,
+    extract::{FromRequestParts, Request, State},
+    http::{request::Parts, StatusCode},
     middleware::Next,
     response::Response,
 };
@@ -14,6 +14,30 @@ use std::sync::Arc;
 /// without a valid DID before they reach handlers.
 #[derive(Debug, Clone)]
 pub struct Did(pub String);
+
+/// Optional DID extractor for read routes.
+///
+/// Reads the same reverse-proxy DID header as `require_auth`, but never
+/// rejects: anonymous requests yield `MaybeDid(None)`.
+#[derive(Debug, Clone)]
+pub struct MaybeDid(pub Option<String>);
+
+impl FromRequestParts<Arc<AppState>> for MaybeDid {
+    type Rejection = std::convert::Infallible;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &Arc<AppState>,
+    ) -> Result<Self, Self::Rejection> {
+        let did = parts
+            .headers
+            .get(&state.cfg.auth.did_header)
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.trim().to_owned())
+            .filter(|s| !s.is_empty());
+        Ok(MaybeDid(did))
+    }
+}
 
 /// Middleware: extract the DID header and stash it in request extensions.
 ///
@@ -60,6 +84,18 @@ pub async fn assert_push_auth(
             if alias.owner_did == did {
                 return Ok(());
             }
+            // Collaborators (writer-role space members) may push too.
+            let is_writer = state
+                .db
+                .get_member_role(&alias.repo_did, did)
+                .await
+                .ok()
+                .flatten()
+                .as_deref()
+                == Some("writer");
+            if is_writer {
+                return Ok(());
+            }
             tracing::warn!(
                 "auth: push denied — {did} tried to push to {}/{} (owner is {})",
                 owner,
@@ -79,4 +115,38 @@ pub async fn assert_push_auth(
             Err(StatusCode::FORBIDDEN)
         }
     }
+}
+
+/// Check that `did` may read `/{owner}/{repo}`.
+///
+/// Public repos (the default) and repos with no DB record are readable by
+/// anyone. Private repos are readable by their owner and by members of the
+/// repo's space; everyone else gets NOT_FOUND so existence isn't leaked.
+pub async fn assert_read_auth(
+    state: &AppState,
+    owner: &str,
+    repo: &str,
+    did: Option<&str>,
+) -> Result<(), StatusCode> {
+    let owner_did = format!("did:plc:{owner}");
+
+    let Ok(repo_did) = state.db.get_repo_did_by_name(&owner_did, repo).await else {
+        // No DB record — untracked disk repo, treated as public.
+        return Ok(());
+    };
+    let private = matches!(state.db.get_repo_visibility(&repo_did).await, Ok(v) if v == "private");
+    if !private {
+        return Ok(());
+    }
+
+    let allowed = match did {
+        Some(d) if d == owner_did => true,
+        Some(d) => state.db.is_repo_member(&repo_did, d).await.unwrap_or(false),
+        None => false,
+    };
+    if allowed {
+        return Ok(());
+    }
+    tracing::warn!("auth: read denied — {did:?} tried to read private repo {owner}/{repo}");
+    Err(StatusCode::NOT_FOUND)
 }

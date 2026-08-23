@@ -65,7 +65,8 @@ pub fn join_safe(root: &Path, segments: &[&str]) -> Option<PathBuf> {
 /// Equivalent to walking the path's [`Component`]s and ensuring none are
 /// `ParentDir`. Kept as an explicit predicate for readability at call sites.
 pub fn has_no_parent_components(path: &Path) -> bool {
-    path.components().all(|c| !matches!(c, Component::ParentDir))
+    path.components()
+        .all(|c| !matches!(c, Component::ParentDir))
 }
 
 #[cfg(test)]

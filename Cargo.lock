@@ -3637,6 +3637,7 @@ dependencies = [
  "chrono",
  "serde",
  "sqlx",
+ "tempfile",
  "thiserror 2.0.20",
  "tokio",
  "tracing",

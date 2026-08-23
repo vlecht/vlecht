@@ -1,4 +1,5 @@
 use crate::error::XrpcError;
+use crate::lex::maybe_auth::OptionalDid;
 use crate::lex::resolve::resolve_repo_path;
 use crate::lex::LexState;
 use axum::extract::{Query, State};
@@ -22,6 +23,7 @@ pub struct Params {
 
 pub async fn handler(
     State(state): State<LexState>,
+    auth: OptionalDid,
     Query(p): Query<Params>,
 ) -> Result<Json<Value>, XrpcError> {
     let raw = p
@@ -31,7 +33,7 @@ pub async fn handler(
         .ok_or_else(|| XrpcError::InvalidRequest("missing repoDid parameter".into()))?;
 
     // Confirm the repo is reachable on disk; otherwise 404.
-    let _ = resolve_repo_path(&state, &raw).await?;
+    let _ = resolve_repo_path(&state, &raw, auth.0.as_deref()).await?;
 
     if !raw.contains('/') {
         // Bare DID form.

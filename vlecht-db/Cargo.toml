@@ -11,3 +11,6 @@ tracing.workspace = true
 sqlx = { version = "0.9", features = ["runtime-tokio", "sqlite", "migrate"] }
 async-trait = "0.1"
 chrono = { version = "0.4", features = ["serde"] }
+
+[dev-dependencies]
+tempfile = "3"
