@@ -5,12 +5,12 @@
 -- membership source. A repo with no row in repo_visibility is public.
 -- Members may clone/read; pushes remain owner-only.
 
-CREATE TABLE repo_visibility (
+CREATE TABLE IF NOT EXISTS repo_visibility (
     repo_did   TEXT PRIMARY KEY,
     visibility TEXT NOT NULL CHECK (visibility IN ('public', 'private'))
 );
 
-CREATE TABLE repo_members (
+CREATE TABLE IF NOT EXISTS repo_members (
     repo_did   TEXT NOT NULL,
     member_did TEXT NOT NULL,
     -- `reader` may clone/fetch; `writer` may additionally push (= Go
@@ -20,4 +20,4 @@ CREATE TABLE repo_members (
     created    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
     PRIMARY KEY (repo_did, member_did)
 );
-CREATE INDEX idx_repo_members_member ON repo_members(member_did);
+CREATE INDEX IF NOT EXISTS idx_repo_members_member ON repo_members(member_did);

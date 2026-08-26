@@ -180,3 +180,119 @@ async fn known_dids_crud() {
 
     cleanup(&path);
 }
+
+
+/// Simulate a Go knotserver database: pre-existing tables matching Go's
+/// schema (with extra columns and Go-only tables), then run our migrations.
+/// Migrations must be idempotent on existing tables, transplant Go
+/// collaborators into writer-role repo_members, and leave all data intact.
+#[tokio::test]
+async fn imports_go_knotserver_db() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("go.db");
+
+    // Build a Go-shaped DB by hand.
+    {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .connect_with(
+                sqlx::sqlite::SqliteConnectOptions::new()
+                    .filename(&path)
+                    .create_if_missing(true),
+            )
+            .await
+            .unwrap();
+        // Go extra columns on shared tables.
+        sqlx::query("CREATE TABLE known_dids (did TEXT PRIMARY KEY)").execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO known_dids VALUES ('did:plc:owner'), ('did:plc:collab')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TABLE public_keys (id INTEGER PRIMARY KEY AUTOINCREMENT, did TEXT NOT NULL, key TEXT NOT NULL, created TEXT NOT NULL, rkey TEXT, UNIQUE(did, key))",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO public_keys (did, key, created, rkey) VALUES ('did:plc:owner', 'ssh-ed25519 AAAA on', '2026-01-01T00:00:00Z', 'r1')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TABLE repo_keys (repo_did TEXT PRIMARY KEY, signing_key BLOB, created_at TEXT NOT NULL, owner_did TEXT, repo_name TEXT, key_type TEXT NOT NULL DEFAULT 'k256', isolated_at DATETIME)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO repo_keys (repo_did, owner_did, repo_name, created_at) VALUES ('did:plc:repo1', 'did:plc:owner', 'myapp', '2026-02-01T00:00:00Z')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TABLE repo_aliases (owner_did TEXT NOT NULL, rkey TEXT NOT NULL, repo_did TEXT NOT NULL, rev TEXT NOT NULL, PRIMARY KEY (owner_did, rkey))",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO repo_aliases VALUES ('did:plc:owner', 'myapp', 'did:plc:repo1', '0_2026-02-01T00:00:00Z')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TABLE collaborators (id INTEGER PRIMARY KEY AUTOINCREMENT, repo_did TEXT, subject_did TEXT, added_by_did TEXT, created TEXT)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO collaborators (repo_did, subject_did, added_by_did, created) VALUES ('did:plc:repo1', 'did:plc:collab', 'did:plc:owner', '2026-03-01T00:00:00Z')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        // Go-only tables that should be ignored, not destroyed.
+        sqlx::query("CREATE TABLE acl (p_type VARCHAR(32), v0 VARCHAR(255))")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("CREATE TABLE migrations (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT UNIQUE)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO migrations (name) VALUES ('initial-schema'), ('add-collaborators'), ('add-uid-counter')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        pool.close().await;
+    }
+
+    // Open + migrate: must succeed on the Go-shaped schema.
+    let db = vlecht_db::Db::open(&path).await.unwrap();
+    db.migrate().await.unwrap();
+
+    // Collaborator transplanted as writer-role member.
+    assert_eq!(
+        db.get_member_role("did:plc:repo1", "did:plc:collab")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("writer")
+    );
+
+    // Data intact: public key with rkey still readable, alias resolves.
+    let keys = db.get_public_keys("did:plc:owner").await.unwrap();
+    assert_eq!(keys.len(), 1);
+    assert_eq!(keys[0].key, "ssh-ed25519 AAAA on");
+    assert_eq!(
+        db.get_repo_did_by_name("did:plc:owner", "myapp").await.unwrap(),
+        "did:plc:repo1"
+    );
+
+    // New feature tables now exist.
+    assert_eq!(db.get_repo_visibility("did:plc:repo1").await.unwrap(), "public");
+    assert!(!db.is_banned("did:plc:collab").await.unwrap());
+
+    // Migrating again is still fine (idempotent transplant).
+    db.migrate().await.unwrap();
+    let members = db.list_repo_members("did:plc:repo1").await.unwrap();
+    assert_eq!(members.len(), 1);
+    assert_eq!(members[0].member_did, "did:plc:collab");
+    assert_eq!(members[0].added_by.as_deref(), Some("did:plc:owner"));
+}

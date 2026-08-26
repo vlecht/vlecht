@@ -3576,96 +3576,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "vlecht"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "axum",
- "chrono",
- "clap",
- "flate2",
- "jacquard-common",
- "jacquard-identity",
- "vlecht-atp",
- "vlecht-db",
- "vlecht-git",
- "mime_guess",
- "rand 0.10.2",
- "reqwest",
- "russh",
- "serde",
- "serde_json",
- "thiserror 2.0.20",
- "tokio",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "vlecht-atp"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "axum",
- "base64",
- "bytes",
- "hex",
- "jacquard-axum",
- "jacquard-common",
- "jacquard-identity",
- "k256",
- "vlecht",
- "vlecht-db",
- "vlecht-git",
- "mime_guess",
- "multibase",
- "rand 0.10.2",
- "reqwest",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "tempfile",
- "thiserror 2.0.20",
- "tokio",
- "tracing",
- "urlencoding",
-]
-
-[[package]]
-name = "vlecht-db"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "chrono",
- "serde",
- "sqlx",
- "tempfile",
- "thiserror 2.0.20",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "vlecht-git"
-version = "0.1.0"
-dependencies = [
- "chrono",
- "flate2",
- "gix",
- "gix-features",
- "gix-object",
- "gix-pack",
- "gix-ref",
- "gix-zlib",
- "miniz_oxide 0.9.1",
- "serde",
- "tar",
- "thiserror 2.0.20",
- "tracing",
- "zip",
-]
-
-[[package]]
 name = "lazy_static"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6375,6 +6285,96 @@ name = "version_check"
 version = "0.9.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
+
+[[package]]
+name = "vlecht"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "chrono",
+ "clap",
+ "flate2",
+ "jacquard-common",
+ "jacquard-identity",
+ "mime_guess",
+ "rand 0.10.2",
+ "reqwest",
+ "russh",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "vlecht-atp",
+ "vlecht-db",
+ "vlecht-git",
+]
+
+[[package]]
+name = "vlecht-atp"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "base64",
+ "bytes",
+ "hex",
+ "jacquard-axum",
+ "jacquard-common",
+ "jacquard-identity",
+ "k256",
+ "mime_guess",
+ "multibase",
+ "rand 0.10.2",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "thiserror 2.0.20",
+ "tokio",
+ "tracing",
+ "urlencoding",
+ "vlecht",
+ "vlecht-db",
+ "vlecht-git",
+]
+
+[[package]]
+name = "vlecht-db"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "serde",
+ "sqlx",
+ "tempfile",
+ "thiserror 2.0.20",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "vlecht-git"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "flate2",
+ "gix",
+ "gix-features",
+ "gix-object",
+ "gix-pack",
+ "gix-ref",
+ "gix-zlib",
+ "miniz_oxide 0.9.1",
+ "serde",
+ "tar",
+ "thiserror 2.0.20",
+ "tracing",
+ "zip",
+]
 
 [[package]]
 name = "walkdir"
