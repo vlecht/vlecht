@@ -44,7 +44,14 @@ async fn repo_ids(state: &LexState, repo: &str) -> Result<(String, String), Xrpc
 }
 
 async fn is_private(state: &LexState, repo_did: &str) -> bool {
-    matches!(state.db.get_repo_visibility(repo_did).await, Ok(v) if v == "private")
+    match state.db.get_repo_visibility(repo_did).await {
+        // Fail closed: DB errors are treated as private (deny).
+        Ok(v) => v == "private",
+        Err(e) => {
+            tracing::error!("space: visibility lookup failed for {repo_did}, failing closed: {e}");
+            true
+        }
+    }
 }
 
 /// `sh.tangled.space.getSpace` — describe a repo's space.

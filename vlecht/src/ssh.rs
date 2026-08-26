@@ -7,6 +7,7 @@ use russh::{Channel, ChannelId, ChannelStream};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Mutex;
 
@@ -90,6 +91,11 @@ impl russh::server::Server for GitSshServer {
     }
 }
 
+/// RFC 3339-ish UTC timestamp (the format `add_public_key` expects).
+fn format_current_utc() -> String {
+    chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string()
+}
+
 // ---------------------------------------------------------------------------
 // Per-connection handler
 // ---------------------------------------------------------------------------
@@ -101,6 +107,101 @@ struct GitSession {
     auth_did: Option<String>,
 }
 
+impl GitSession {
+    /// Resolve the offered key against the user's own PDS when the SSH
+    /// username asserts an atproto identity (a DID, or a handle we can
+    /// resolve to one). Returns the DID when the PDS publishes a matching
+    /// `sh.tangled.publicKey` record. Results are TTL-cached; a matched key
+    /// is also persisted to the local `public_keys` table so subsequent
+    /// `git@` logins work without another PDS round-trip.
+    async fn resolve_via_pds(&self, user: &str, offered: &str) -> Option<String> {
+        use crate::PdsKeyCache;
+        use jacquard_identity::resolver::IdentityResolver;
+
+        const POS_TTL: Duration = Duration::from_secs(300);
+        const NEG_TTL: Duration = Duration::from_secs(60);
+
+        // Username claim: "git" carries no identity (GitHub-style), and a
+        // bare word with no dot is not a resolvable handle.
+        let did = if user.starts_with("did:") {
+            user.to_owned()
+        } else if user != "git" && user.contains('.') {
+            let handle: jacquard_common::types::string::Handle =
+                jacquard_common::types::string::Handle::new_owned(user).ok()?;
+            match self.state.identity.resolver.resolve_handle(&handle).await {
+                Ok(d) => d.to_string(),
+                Err(e) => {
+                    tracing::debug!("SSH auth: handle resolution failed for {user}: {e}");
+                    return None;
+                }
+            }
+        } else {
+            return None;
+        };
+
+        // Cache check.
+        {
+            let mut cache = self.state.pds_key_cache.lock().await;
+            match cache.get(&did) {
+                Some(PdsKeyCache::Keys(keys, until)) if *until > Instant::now() => {
+                    let keys = keys.clone();
+                    if keys
+                        .iter()
+                        .any(|k| normalize_pubkey(k).is_some_and(|s| s == offered))
+                    {
+                        drop(cache);
+                        self.persist_pds_key(&did, offered).await;
+                        return Some(did);
+                    }
+                    return None;
+                }
+                Some(PdsKeyCache::Miss(until)) if *until > Instant::now() => return None,
+                _ => {
+                    cache.remove(&did);
+                }
+            }
+        }
+
+        match vlecht_atp::pds_keys::fetch_pds_pubkeys(&self.state.identity, &did).await {
+            Ok(keys) => {
+                let found = keys
+                    .iter()
+                    .any(|k| normalize_pubkey(k).is_some_and(|s| s == offered));
+                let mut cache = self.state.pds_key_cache.lock().await;
+                cache.insert(
+                    did.clone(),
+                    PdsKeyCache::Keys(keys, Instant::now() + POS_TTL),
+                );
+                drop(cache);
+                if found {
+                    self.persist_pds_key(&did, offered).await;
+                    Some(did)
+                } else {
+                    None
+                }
+            }
+            Err(e) => {
+                tracing::debug!("SSH auth: PDS pubkey lookup failed for {did}: {e}");
+                self.state
+                    .pds_key_cache
+                    .lock()
+                    .await
+                    .insert(did, PdsKeyCache::Miss(Instant::now() + NEG_TTL));
+                None
+            }
+        }
+    }
+
+    /// Record a PDS-published key locally so future logins skip the lookup.
+    async fn persist_pds_key(&self, did: &str, key: &str) {
+        let _ = self.state.db.add_did(did).await;
+        let created = format_current_utc();
+        if let Err(e) = self.state.db.add_public_key(did, key, &created).await {
+            tracing::warn!("SSH auth: failed to persist PDS key for {did}: {e}");
+        }
+    }
+}
+
 impl russh::server::Handler for GitSession {
     type Error = anyhow::Error;
 
@@ -109,8 +210,10 @@ impl russh::server::Handler for GitSession {
         user: &str,
         key: &PublicKey,
     ) -> Result<russh::server::Auth, Self::Error> {
-        // Identity comes from the key, not the username (GitHub-style).
-        // Resolve the offered key to a DID via the public_keys table.
+        // Fast path: identity comes from the locally-registered key table.
+        // Slow path: when the username is an atproto identity (handle or
+        // DID, not "git"), resolve the user's `sh.tangled.publicKey`
+        // records from their PDS and compare — like knot2 does.
         let offered = match key.to_openssh().ok().and_then(|s| normalize_pubkey(&s)) {
             Some(n) => n,
             None => {
@@ -132,6 +235,12 @@ impl russh::server::Handler for GitSession {
                 }
             }
             Err(e) => tracing::error!("SSH auth: db error: {e}"),
+        }
+
+        if let Some(did) = self.resolve_via_pds(user, &offered).await {
+            tracing::debug!("SSH auth: user={user} accepted via PDS as {did}");
+            self.auth_did = Some(did);
+            return Ok(russh::server::Auth::Accept);
         }
         tracing::warn!("SSH auth: rejected for user={user}");
         Ok(russh::server::Auth::Reject {

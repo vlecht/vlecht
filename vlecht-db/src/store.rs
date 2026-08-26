@@ -86,6 +86,20 @@ pub trait RepoStore {
     /// in practice (one row per registered user key).
     async fn get_did_by_public_key(&self, key: &str) -> Result<Option<String>, DbError>;
 
+    // --- knot blocklist ---
+
+    /// Ban a DID at the knot level (insert or ignore).
+    async fn ban_account(&self, did: &str, added_by: Option<&str>) -> Result<(), DbError>;
+
+    /// Lift a ban.
+    async fn unban_account(&self, did: &str) -> Result<(), DbError>;
+
+    /// Check whether a DID is banned.
+    async fn is_banned(&self, did: &str) -> Result<bool, DbError>;
+
+    /// List all banned DIDs.
+    async fn list_banned(&self) -> Result<Vec<String>, DbError>;
+
     // --- public_keys ---
 
     /// Get all public keys for a DID.
@@ -403,6 +417,41 @@ impl RepoStore for Db {
         Ok(None)
     }
 
+    async fn ban_account(&self, did: &str, added_by: Option<&str>) -> Result<(), DbError> {
+        sqlx::query("INSERT OR IGNORE INTO knot_blocklist (did, added_by) VALUES (?, ?)")
+            .bind(did)
+            .bind(added_by)
+            .execute(self.pool())
+            .await?;
+        Ok(())
+    }
+
+    async fn unban_account(&self, did: &str) -> Result<(), DbError> {
+        sqlx::query("DELETE FROM knot_blocklist WHERE did = ?")
+            .bind(did)
+            .execute(self.pool())
+            .await?;
+        Ok(())
+    }
+
+    async fn is_banned(&self, did: &str) -> Result<bool, DbError> {
+        let row = sqlx::query("SELECT count(1) as cnt FROM knot_blocklist WHERE did = ?")
+            .bind(did)
+            .fetch_one(self.pool())
+            .await?;
+        let count: i64 = row.try_get("cnt")?;
+        Ok(count > 0)
+    }
+
+    async fn list_banned(&self) -> Result<Vec<String>, DbError> {
+        let rows = sqlx::query("SELECT did FROM knot_blocklist ORDER BY created ASC")
+            .fetch_all(self.pool())
+            .await?;
+        rows.iter()
+            .map(|r| r.try_get("did").map_err(DbError::Sqlx))
+            .collect()
+    }
+
     async fn is_repo_member(&self, repo_did: &str, member_did: &str) -> Result<bool, DbError> {
         let row = sqlx::query(
             "SELECT count(1) as cnt FROM repo_members WHERE repo_did = ? AND member_did = ?",
@@ -677,5 +726,26 @@ mod tests {
         db.delete_repo(&repo).await.unwrap();
         assert_eq!(db.get_repo_visibility(&repo).await.unwrap(), "public");
         assert!(db.list_repo_members(&repo).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn blocklist_ban_unban() {
+        let (_dir, db) = test_db().await;
+        assert!(!db.is_banned("did:plc:troll").await.unwrap());
+        assert!(db.list_banned().await.unwrap().is_empty());
+
+        db.ban_account("did:plc:troll", Some("did:plc:admin"))
+            .await
+            .unwrap();
+        // idempotent
+        db.ban_account("did:plc:troll", Some("did:plc:admin"))
+            .await
+            .unwrap();
+        assert!(db.is_banned("did:plc:troll").await.unwrap());
+        assert_eq!(db.list_banned().await.unwrap(), vec!["did:plc:troll"]);
+
+        db.unban_account("did:plc:troll").await.unwrap();
+        assert!(!db.is_banned("did:plc:troll").await.unwrap());
+        assert!(db.list_banned().await.unwrap().is_empty());
     }
 }

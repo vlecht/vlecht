@@ -20,6 +20,18 @@ pub struct AppState {
     /// Service auth config for XRPC write endpoints. None when ATproto is
     /// disabled (write endpoints return 401).
     pub atp_service_auth: Arc<Option<vlecht_atp::ServiceAuthConfig<vlecht_atp::PublicResolver>>>,
+    /// Identity resolver, used to resolve SSH users' PDS pubkey records.
+    pub identity: Arc<vlecht_atp::identity::AtpIdentity>,
+    /// TTL cache for PDS `sh.tangled.publicKey` lookups (SSH auth).
+    pub pds_key_cache: tokio::sync::Mutex<std::collections::HashMap<String, PdsKeyCache>>,
+}
+
+/// Cached outcome of a PDS pubkey lookup.
+pub enum PdsKeyCache {
+    /// `(keys, fresh_until)`
+    Keys(Vec<String>, std::time::Instant),
+    /// `(fresh_until)` — resolution or transport failed; retry later.
+    Miss(std::time::Instant),
 }
 
 /// Build the application router with all routes and state.
@@ -52,20 +64,28 @@ pub fn build_app(state: Arc<AppState>) -> Router {
         .into_service();
 
     // Protected write routes — always require an authenticated DID.
+    // git-receive-pack accepts knot2-style service-auth JWTs (Bearer or
+    // Basic password) as well as the proxy DID header.
     // Raise the body limit for git push (pack data can be large).
     // axum's default Bytes extractor caps at 2 MB, which rejects real pushes.
-    let protected = Router::new()
+    let receive = Router::new()
         .route(
             "/{owner}/{repo}/git-receive-pack",
             post(handlers::receive_pack),
         )
+        .route_layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            auth::git_push_auth,
+        ))
+        .layer(axum::extract::DefaultBodyLimit::max(512 * 1024 * 1024));
+
+    let protected = Router::new()
         .route("/api/repos", post(handlers::create_repo))
         .route("/api/repos/{owner}/{repo}", delete(handlers::delete_repo))
         .route_layer(axum::middleware::from_fn_with_state(
             state.clone(),
             auth::require_auth,
-        ))
-        .layer(axum::extract::DefaultBodyLimit::max(512 * 1024 * 1024));
+        ));
 
     // did:web DID document endpoint — served at /.well-known/did.json.
     // Only active when ATproto is enabled (audience DID + key file set).
@@ -99,6 +119,7 @@ pub fn build_app(state: Arc<AppState>) -> Router {
     let app = public
         .route("/.well-known/did.json", get(did_handler))
         .nest_service("/xrpc", atp)
+        .merge(receive)
         .merge(protected)
         .with_state(state)
         .layer(axum::middleware::from_fn(middleware::cors_middleware))
@@ -132,6 +153,7 @@ pub fn build_state(db: Db, cfg: Arc<config::Config>) -> Arc<AppState> {
     };
 
     let service_auth = vlecht_atp::service_auth::build_service_auth_config(&atp_config, &identity);
+    let identity = Arc::new(identity);
 
     let lex_state = vlecht_atp::lex::LexState {
         db: db.clone(),
@@ -148,5 +170,7 @@ pub fn build_state(db: Db, cfg: Arc<config::Config>) -> Arc<AppState> {
         cfg,
         atp: Arc::new(lex_state),
         atp_service_auth: Arc::new(service_auth),
+        identity,
+        pds_key_cache: tokio::sync::Mutex::new(std::collections::HashMap::new()),
     })
 }

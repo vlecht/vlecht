@@ -1,0 +1,39 @@
+{
+  "lexicon": 1,
+  "id": "sh.tangled.space.removeMember",
+  "defs": {
+    "main": {
+      "type": "procedure",
+      "description": "Revoke a DID's membership in a repo's space. Owner only.",
+      "parameters": {
+        "type": "params",
+        "required": [],
+        "properties": {}
+      },
+      "input": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": ["repo", "member"],
+          "properties": {
+            "repo": { "type": "string", "description": "Repo DID or owner/name form." },
+            "member": { "type": "string", "format": "did" }
+          }
+        }
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": ["ok"],
+          "properties": { "ok": { "type": "boolean" } }
+        }
+      },
+      "errors": [
+        { "name": "InvalidRequest" },
+        { "name": "Unauthorized" },
+        { "name": "RepoNotFound" }
+      ]
+    }
+  }
+}

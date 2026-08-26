@@ -26,7 +26,16 @@ async fn assert_membership_visible(
     owner_did: &str,
     actor: Option<&str>,
 ) -> Result<(), XrpcError> {
-    let private = matches!(state.db.get_repo_visibility(repo_did).await, Ok(v) if v == "private");
+    // Fail closed: DB errors are treated as private (deny).
+    let private = match state.db.get_repo_visibility(repo_did).await {
+        Ok(v) => v == "private",
+        Err(e) => {
+            tracing::error!(
+                "collaborators: visibility lookup failed for {repo_did}, failing closed: {e}"
+            );
+            true
+        }
+    };
     if !private {
         return Ok(());
     }

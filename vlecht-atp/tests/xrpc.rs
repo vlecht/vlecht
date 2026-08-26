@@ -1141,6 +1141,7 @@ struct AuthServer {
     handle: ServerHandle,
     signing_key: k256::ecdsa::SigningKey,
     member_signing_key: k256::ecdsa::SigningKey,
+    sa_cfg: jacquard_axum::service_auth::ServiceAuthConfig<MockResolver>,
 }
 
 impl std::ops::Deref for AuthServer {
@@ -1194,6 +1195,7 @@ impl AuthServer {
             audience_did: TEST_AUDIENCE_DID.to_string(),
         };
 
+        let sa_cfg_clone = sa_cfg.clone().unwrap();
         let xrpc_router = vlecht_atp::lex::router(lex_state, sa_cfg);
         let app = axum::Router::new().nest_service("/xrpc", xrpc_router);
         let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
@@ -1207,6 +1209,7 @@ impl AuthServer {
             handle: ServerHandle { tmpdir, port, db },
             signing_key,
             member_signing_key,
+            sa_cfg: sa_cfg_clone,
         }
     }
 
@@ -2319,6 +2322,172 @@ async fn xrpc_collaborators_private_repo_gating() {
 
     // Collaborator on a private repo can read too (writer is a member role).
     let q = format!("/xrpc/sh.tangled.repo.branches?repo={TEST_ISSUER_DID}/collabpriv");
+    let (status, _) = server.get_member(&q).await;
+    assert_eq!(status, 200);
+}
+
+// ---------------------------------------------------------------------------
+// sh.tangled.repo.push service-auth tokens (knot2-compatible git auth)
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread")]
+async fn service_auth_push_token_validation() {
+    use base64::Engine;
+    let server = AuthServer::start().await;
+    let cfg = &server.sa_cfg;
+
+    let push_jwt = mint_service_auth_jwt(
+        TEST_ISSUER_DID,
+        TEST_AUDIENCE_DID,
+        "sh.tangled.repo.push",
+        &server.signing_key,
+    );
+
+    // Bearer form → owner DID.
+    let did =
+        vlecht_atp::service_auth::did_from_push_auth(Some(&format!("Bearer {push_jwt}")), cfg).await;
+    assert_eq!(did.as_deref(), Some(TEST_ISSUER_DID));
+
+    // Basic form — JWT as password, DID-shaped username.
+    let basic = format!(
+        "Basic {}",
+        base64::engine::general_purpose::STANDARD.encode(format!("{TEST_ISSUER_DID}:{push_jwt}"))
+    );
+    let did = vlecht_atp::service_auth::did_from_push_auth(Some(&basic), cfg).await;
+    assert_eq!(did.as_deref(), Some(TEST_ISSUER_DID));
+
+    // A token minted for a different lxm is not a push token.
+    let create_jwt = mint_service_auth_jwt(
+        TEST_ISSUER_DID,
+        TEST_AUDIENCE_DID,
+        "sh.tangled.repo.create",
+        &server.signing_key,
+    );
+    let did =
+        vlecht_atp::service_auth::did_from_push_auth(Some(&format!("Bearer {create_jwt}")), cfg)
+            .await;
+    assert_eq!(did, None);
+
+    // ...but with no required lxm (read-identity use), it still proves DID.
+    let did = vlecht_atp::service_auth::did_from_service_auth(
+        Some(&format!("Bearer {create_jwt}")),
+        cfg,
+        None,
+    )
+    .await;
+    assert_eq!(did.as_deref(), Some(TEST_ISSUER_DID));
+
+    // Garbage and wrong-audience tokens are rejected.
+    let did = vlecht_atp::service_auth::did_from_push_auth(Some("Bearer garbage"), cfg).await;
+    assert_eq!(did, None);
+    let wrong_aud = mint_service_auth_jwt(
+        TEST_ISSUER_DID,
+        "did:web:elsewhere.example",
+        "sh.tangled.repo.push",
+        &server.signing_key,
+    );
+    let did =
+        vlecht_atp::service_auth::did_from_push_auth(Some(&format!("Bearer {wrong_aud}")), cfg)
+            .await;
+    assert_eq!(did, None);
+
+    // Member identity resolves through its own document too.
+    let member_push = mint_service_auth_jwt(
+        TEST_MEMBER_DID,
+        TEST_AUDIENCE_DID,
+        "sh.tangled.repo.push",
+        &server.member_signing_key,
+    );
+    let did =
+        vlecht_atp::service_auth::did_from_push_auth(Some(&format!("Bearer {member_push}")), cfg)
+            .await;
+    assert_eq!(did.as_deref(), Some(TEST_MEMBER_DID));
+}
+
+// ---------------------------------------------------------------------------
+// Knot blocklist (ban/unban) tests
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread")]
+async fn xrpc_knot_blocklist_lifecycle() {
+    let server = AuthServer::start().await;
+    let repo_did = create_private_repo(&server, "banrepo").await;
+    let repo_param = format!("{TEST_ISSUER_DID}/banrepo");
+
+    // Grant the member reader access and confirm it works.
+    let (status, _) = server
+        .post(
+            "/xrpc/sh.tangled.space.addMember",
+            &serde_json::json!({"repo": repo_did, "member": TEST_MEMBER_DID}),
+        )
+        .await;
+    assert_eq!(status, 200);
+    let q = format!("/xrpc/sh.tangled.repo.branches?repo={repo_param}");
+    let (status, _) = server.get_member(&q).await;
+    assert_eq!(status, 200);
+
+    // Non-admin cannot ban.
+    let (status, _) = server
+        .post_member(
+            "/xrpc/sh.tangled.knot.ban",
+            &serde_json::json!({"did": TEST_MEMBER_DID}),
+        )
+        .await;
+    assert!(status >= 400, "non-admin ban returned {status}");
+
+    // The admin cannot be banned.
+    let (status, body) = server
+        .post(
+            "/xrpc/sh.tangled.knot.ban",
+            &serde_json::json!({"did": TEST_ISSUER_DID}),
+        )
+        .await;
+    assert_eq!(status, 400, "body={body}");
+
+    // Admin bans the member: member-derived read access is revoked,
+    // and the member can no longer call write endpoints either.
+    let (status, _) = server
+        .post(
+            "/xrpc/sh.tangled.knot.ban",
+            &serde_json::json!({"did": TEST_MEMBER_DID}),
+        )
+        .await;
+    assert_eq!(status, 200);
+
+    let q = format!("/xrpc/sh.tangled.repo.branches?repo={repo_param}");
+    let (status, _) = server.get_member(&q).await;
+    assert!(status >= 400, "banned member kept read access: {status}");
+
+    let (status, _) = server
+        .post_member(
+            "/xrpc/sh.tangled.space.addMember",
+            &serde_json::json!({"repo": repo_did, "member": TEST_MEMBER_DID}),
+        )
+        .await;
+    assert!(status >= 400, "banned member kept write access: {status}");
+
+    // The banned member cannot unban themselves; the admin's own access
+    // is untouched.
+    let (status, _) = server
+        .post_member(
+            "/xrpc/sh.tangled.knot.unban",
+            &serde_json::json!({"did": TEST_MEMBER_DID}),
+        )
+        .await;
+    assert!(status >= 400);
+    let q = format!("/xrpc/sh.tangled.repo.branches?repo={repo_param}");
+    let (status, _) = server.get_owner(&q).await;
+    assert_eq!(status, 200);
+
+    // Admin unbans: access is restored (membership itself was never removed).
+    let (status, _) = server
+        .post(
+            "/xrpc/sh.tangled.knot.unban",
+            &serde_json::json!({"did": TEST_MEMBER_DID}),
+        )
+        .await;
+    assert_eq!(status, 200);
+    let q = format!("/xrpc/sh.tangled.repo.branches?repo={repo_param}");
     let (status, _) = server.get_member(&q).await;
     assert_eq!(status, 200);
 }

@@ -1,0 +1,56 @@
+{
+  "lexicon": 1,
+  "id": "sh.tangled.space.getSpace",
+  "defs": {
+    "main": {
+      "type": "query",
+      "description": "Describe the knot-hosted space for a repo: its space URI, visibility, and (for private repos, to owner/members only) the member list.",
+      "parameters": {
+        "type": "params",
+        "required": ["repo"],
+        "properties": {
+          "repo": {
+            "type": "string",
+            "description": "Repo DID or owner/name form."
+          }
+        }
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": ["space", "visibility"],
+          "properties": {
+            "space": {
+              "type": "string",
+              "format": "at-uri",
+              "description": "at://{knot-did}/space/sh.tangled.repo/{repo-did}"
+            },
+            "visibility": {
+              "type": "string",
+              "enum": ["public", "private"]
+            },
+            "owner": {
+              "type": "string",
+              "format": "did",
+              "description": "Present only for private repos, to owner/members."
+            },
+            "members": {
+              "type": "array",
+              "description": "Present only for private repos, to owner/members.",
+              "items": {
+                "type": "object",
+                "required": ["did", "role"],
+                "properties": {
+                  "did": { "type": "string", "format": "did" },
+                  "role": { "type": "string", "enum": ["reader", "writer"] }
+                }
+              }
+            }
+          }
+        }
+      },
+      "errors": [{ "name": "RepoNotFound" }]
+    }
+  }
+}

@@ -35,7 +35,23 @@ impl FromRequestParts<Arc<AppState>> for MaybeDid {
             .and_then(|v| v.to_str().ok())
             .map(|s| s.trim().to_owned())
             .filter(|s| !s.is_empty());
-        Ok(MaybeDid(did))
+        if did.is_some() {
+            return Ok(MaybeDid(did));
+        }
+
+        // knot2-style service-auth token (e.g. `git clone` with the JWT as
+        // Basic password): proves the caller's DID for private-repo reads.
+        // Any valid lxm is accepted — the token only establishes identity.
+        let authz = parts
+            .headers
+            .get(axum::http::header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned);
+        if let (Some(authz), Some(cfg)) = (authz, state.atp_service_auth.as_ref()) {
+            let did = vlecht_atp::service_auth::did_from_service_auth(Some(&authz), cfg, None).await;
+            return Ok(MaybeDid(did));
+        }
+        Ok(MaybeDid(None))
     }
 }
 
@@ -66,6 +82,39 @@ pub async fn require_auth(
     }
 }
 
+/// Auth for `git-receive-pack`: prefer knot2-style service-auth carry —
+/// `Authorization: Bearer <jwt>` or the JWT as the Basic-auth password,
+/// with `lxm: sh.tangled.repo.push`. When no Authorization header is
+/// present, fall back to the reverse-proxy DID header (`require_auth`).
+pub async fn git_push_auth(
+    State(state): State<Arc<AppState>>,
+    req: Request,
+    next: Next,
+) -> Result<Response, StatusCode> {
+    let authz = req
+        .headers()
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
+
+    match authz {
+        Some(authz) => {
+            let Some(cfg) = state.atp_service_auth.as_ref() else {
+                return Err(StatusCode::UNAUTHORIZED);
+            };
+            match vlecht_atp::service_auth::did_from_push_auth(Some(&authz), cfg).await {
+                Some(did) => {
+                    let mut req = req;
+                    req.extensions_mut().insert(Did(did));
+                    Ok(next.run(req).await)
+                }
+                None => Err(StatusCode::UNAUTHORIZED),
+            }
+        }
+        None => require_auth(State(state), req, next).await,
+    }
+}
+
 /// Check that the requesting DID owns the repo at `/{owner}/{repo}`.
 ///
 /// Looks up the repo alias (owner_did + rkey) and verifies the owner matches.
@@ -77,6 +126,12 @@ pub async fn assert_push_auth(
     did: &str,
 ) -> Result<(), StatusCode> {
     let expected_did = format!("did:plc:{owner}");
+
+    // Banned accounts forfeit all repo access except the knot admin's own.
+    if did != state.atp.owner_did && state.db.is_banned(did).await.unwrap_or(true) {
+        tracing::warn!("auth: push denied — {did} is banned");
+        return Err(StatusCode::FORBIDDEN);
+    }
 
     // Try DB alias lookup first
     match state.db.find_repo_alias(&expected_did, repo).await {
@@ -134,13 +189,24 @@ pub async fn assert_read_auth(
         // No DB record — untracked disk repo, treated as public.
         return Ok(());
     };
-    let private = matches!(state.db.get_repo_visibility(&repo_did).await, Ok(v) if v == "private");
+    // Fail closed: a DB error while reading visibility is treated as
+    // private (deny), never as public.
+    let private = match state.db.get_repo_visibility(&repo_did).await {
+        Ok(v) => v == "private",
+        Err(e) => {
+            tracing::error!("auth: visibility lookup failed for {repo_did}, failing closed: {e}");
+            true
+        }
+    };
     if !private {
         return Ok(());
     }
 
     let allowed = match did {
+        // The repo owner keeps read access even under a ban.
         Some(d) if d == owner_did => true,
+        // Member-derived reads are revoked while banned.
+        Some(d) if d != state.atp.owner_did && state.db.is_banned(d).await.unwrap_or(true) => false,
         Some(d) => state.db.is_repo_member(&repo_did, d).await.unwrap_or(false),
         None => false,
     };

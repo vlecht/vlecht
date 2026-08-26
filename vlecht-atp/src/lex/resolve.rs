@@ -30,11 +30,24 @@ pub async fn resolve_repo_path(
     let (path, ids) = resolve_inner(state, input).await?;
 
     if let Some((repo_did, owner_did)) = ids {
-        let private =
-            matches!(state.db.get_repo_visibility(&repo_did).await, Ok(v) if v == "private");
+        // Fail closed: DB errors are treated as private (deny).
+        let private = match state.db.get_repo_visibility(&repo_did).await {
+            Ok(v) => v == "private",
+            Err(e) => {
+                tracing::error!(
+                    "resolve: visibility lookup failed for {repo_did}, failing closed: {e}"
+                );
+                true
+            }
+        };
         if private {
             let allowed = match actor {
+                // The repo owner keeps read access even under a ban.
                 Some(d) if d == owner_did => true,
+                // Banned members forfeit member-derived reads.
+                Some(d) if d != state.owner_did && state.db.is_banned(d).await.unwrap_or(true) => {
+                    false
+                }
                 Some(d) => state.db.is_repo_member(&repo_did, d).await.unwrap_or(false),
                 None => false,
             };

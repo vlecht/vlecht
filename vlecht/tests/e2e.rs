@@ -1373,3 +1373,41 @@ async fn e2e_private_repo_ssh_visibility() {
         "nope\n"
     );
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_banned_owner_push_denied() {
+    let port = unique_port();
+    let server = ServerHandle::start(port, None).await;
+    server.init_repo("alice", "banpush").await;
+
+    // Seed a commit as the owner (works before the ban).
+    let wd = server.workdir("banwork");
+    let local = wd.join("src");
+    std::fs::create_dir_all(&local).unwrap();
+    git(&local, &["init"]);
+    std::fs::write(local.join("a.txt"), "1\n").unwrap();
+    git(&local, &["add", "."]);
+    git(&local, &["commit", "-m", "one"]);
+    let url = server.http_url("alice", "banpush");
+    git_push(&local, &["push", &url, "main"], "did:plc:alice");
+
+    // Ban the owner — subsequent pushes are denied (knot2 semantics: a
+    // banned account forfeits push even with ownership).
+    server.db.ban_account("did:plc:alice", None).await.unwrap();
+    std::fs::write(local.join("b.txt"), "2\n").unwrap();
+    git(&local, &["add", "."]);
+    git(&local, &["commit", "-m", "two"]);
+    let stderr = git_fail(
+        &local,
+        &["push", &url, "main"],
+        Some("http.extraHeader=X-Vlecht-DID: did:plc:alice".into()),
+    );
+    assert!(
+        stderr.contains("not authorized") || stderr.contains("denied") || stderr.contains("403"),
+        "{stderr}"
+    );
+
+    // Unban — push works again.
+    server.db.unban_account("did:plc:alice").await.unwrap();
+    git_push(&local, &["push", &url, "main"], "did:plc:alice");
+}

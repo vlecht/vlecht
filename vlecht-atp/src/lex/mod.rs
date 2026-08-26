@@ -13,6 +13,7 @@
 pub mod archive;
 pub mod authz;
 pub mod blob;
+pub mod blocklist;
 pub mod branch;
 pub mod branches;
 pub mod collaborators;
@@ -174,6 +175,8 @@ where
             "/sh.tangled.repo.addCollaborator",
             post(collaborators::add_collaborator),
         )
+        .route("/sh.tangled.knot.ban", post(blocklist::ban))
+        .route("/sh.tangled.knot.unban", post(blocklist::unban))
         .route(
             "/sh.tangled.repo.removeCollaborator",
             post(collaborators::remove_collaborator),

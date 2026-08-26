@@ -1,0 +1,41 @@
+{
+  "lexicon": 1,
+  "id": "sh.tangled.space.listMembers",
+  "defs": {
+    "main": {
+      "type": "query",
+      "description": "List the members of a repo's space. For private repos only the owner and members may list (others get RepoNotFound). Public repos have empty membership.",
+      "parameters": {
+        "type": "params",
+        "required": ["repo"],
+        "properties": {
+          "repo": {
+            "type": "string",
+            "description": "Repo DID or owner/name form."
+          }
+        }
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": ["members"],
+          "properties": {
+            "members": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "required": ["did", "role"],
+                "properties": {
+                  "did": { "type": "string", "format": "did" },
+                  "role": { "type": "string", "enum": ["reader", "writer"] }
+                }
+              }
+            }
+          }
+        }
+      },
+      "errors": [{ "name": "RepoNotFound" }]
+    }
+  }
+}

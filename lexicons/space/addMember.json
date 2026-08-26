@@ -1,0 +1,44 @@
+{
+  "lexicon": 1,
+  "id": "sh.tangled.space.addMember",
+  "defs": {
+    "main": {
+      "type": "procedure",
+      "description": "Grant a DID membership in a repo's space. reader may clone/fetch; writer may additionally push (writer == Go knotserver collaborator). Owner only.",
+      "parameters": {
+        "type": "params",
+        "required": [],
+        "properties": {}
+      },
+      "input": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": ["repo", "member"],
+          "properties": {
+            "repo": { "type": "string", "description": "Repo DID or owner/name form." },
+            "member": { "type": "string", "format": "did" },
+            "role": {
+              "type": "string",
+              "description": "Defaults to reader.",
+              "enum": ["reader", "writer"]
+            }
+          }
+        }
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": ["ok"],
+          "properties": { "ok": { "type": "boolean" } }
+        }
+      },
+      "errors": [
+        { "name": "InvalidRequest" },
+        { "name": "Unauthorized" },
+        { "name": "RepoNotFound" }
+      ]
+    }
+  }
+}

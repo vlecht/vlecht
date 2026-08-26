@@ -8,6 +8,7 @@ pub mod config;
 pub mod error;
 pub mod identity;
 pub mod lex;
+pub mod pds_keys;
 pub mod service_auth;
 
 /// Re-exported so the `vlecht` binary crate can name the service-auth config

@@ -10,6 +10,16 @@ use crate::error::XrpcError;
 use crate::lex::LexState;
 use vlecht_db::RepoStore;
 
+/// The knot admin is exempt from the blocklist; every other banned actor
+/// gets Unauthorized.
+async fn deny_if_banned(state: &LexState, actor_did: &str) -> Result<(), XrpcError> {
+    if actor_did != state.owner_did && state.db.is_banned(actor_did).await.unwrap_or(true) {
+        tracing::warn!("authz: {actor_did} denied write — banned");
+        return Err(XrpcError::Unauthorized);
+    }
+    Ok(())
+}
+
 /// Verify `actor_did` owns the repo named `name` under `owner_did`, returning
 /// the repo_did on success.
 ///
@@ -25,6 +35,7 @@ pub async fn assert_owns_by_name(
         tracing::warn!("authz: {actor_did} denied write to {owner_did}/{name} (not owner)");
         return Err(XrpcError::Unauthorized);
     }
+    deny_if_banned(state, actor_did).await?;
     state
         .db
         .get_repo_did_by_name(owner_did, name)
@@ -62,5 +73,6 @@ pub async fn assert_owns_by_repo(
         tracing::warn!("authz: {actor_did} denied write to {repo} (owner is {owner_did})");
         return Err(XrpcError::Unauthorized);
     }
+    deny_if_banned(state, actor_did).await?;
     Ok(repo_did)
 }
