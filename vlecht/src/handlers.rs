@@ -1,4 +1,4 @@
-use crate::auth::{assert_push_auth, assert_read_auth, Did, MaybeDid};
+use crate::auth::{assert_push_auth, assert_read_auth, normalize_owner_did, Did, MaybeDid};
 use crate::AppState;
 use axum::{
     body::Body,
@@ -8,7 +8,7 @@ use axum::{
 };
 use flate2::bufread::GzDecoder;
 use vlecht_db::RepoStore;
-use vlecht_git::paths::{is_safe_segment, join_safe, resolve_within_root};
+use vlecht_git::paths::join_safe;
 use vlecht_git::{ArchiveFormat, GitRepo};
 use serde::Deserialize;
 use std::io::Read;
@@ -23,32 +23,7 @@ async fn resolve_repo_path(
     owner: &str,
     repo: &str,
 ) -> Result<std::path::PathBuf, StatusCode> {
-    // Reject path-traversal segments before joining anything.
-    if !is_safe_segment(owner) || !is_safe_segment(repo) {
-        return Err(StatusCode::NOT_FOUND);
-    }
-    let root = &state.cfg.repo_scan_path;
-    // Aliases are stored with full DIDs; HTTP routes carry the short owner name.
-    let owner_did = format!("did:plc:{owner}");
-    if let Ok(alias) = state.db.find_repo_alias(&owner_did, repo).await {
-        if is_safe_segment(&alias.repo_did) {
-            let candidate = root.join(&alias.repo_did);
-            if let Some(canon) = resolve_within_root(root, &candidate) {
-                if GitRepo::open(&canon).is_ok() {
-                    return Ok(canon);
-                }
-            }
-        }
-    }
-
-    let legacy = join_safe(root, &[owner, repo]).ok_or(StatusCode::NOT_FOUND)?;
-    if let Some(canon) = resolve_within_root(root, &legacy) {
-        if GitRepo::open(&canon).is_ok() {
-            return Ok(canon);
-        }
-    }
-
-    Err(StatusCode::NOT_FOUND)
+    crate::resolve::resolve_repo_path(state, owner, repo).await.ok_or(StatusCode::NOT_FOUND)
 }
 
 async fn open_repo(state: &AppState, owner: &str, repo: &str) -> Result<GitRepo, StatusCode> {
@@ -416,7 +391,12 @@ pub async fn create_repo(
     }
 
     let default_branch = body.default_branch.as_deref().unwrap_or("main");
-    let repo_path = join_safe(&state.cfg.repo_scan_path, &[&body.owner, &body.name])
+
+    // Canonical layout: bare repo directly under its repo DID dir (Go parity).
+    vlecht_atp::lex::create_repo::validate_repo_name(&body.name)
+        .map_err(|_| StatusCode::BAD_REQUEST)?;
+    let repo_did = vlecht_atp::lex::derive_repo_did(&expected, &body.name);
+    let repo_path = join_safe(&state.cfg.repo_scan_path, &[&repo_did])
         .ok_or(StatusCode::BAD_REQUEST)?;
 
     if repo_path.exists() {
@@ -429,10 +409,9 @@ pub async fn create_repo(
     GitRepo::init_bare(&repo_path, default_branch)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    // Track in database: deterministic repo DID (same derivation as the
-    // XRPC create endpoint) so visibility/membership keys are per-repo.
-    let owner_did = format!("did:plc:{}", body.owner);
-    let repo_did = vlecht_atp::lex::derive_repo_did(&owner_did, &body.name);
+    // Track in database: the repo DID doubles as the on-disk directory name,
+    // so visibility/membership keys are per-repo.
+    let owner_did = expected.clone();
     state
         .db
         .add_did(&owner_did)
@@ -467,17 +446,15 @@ pub async fn delete_repo(
 ) -> Result<Response, StatusCode> {
     assert_push_auth(&state, &owner, &repo, &did.0).await?;
 
-    let repo_path = join_safe(&state.cfg.repo_scan_path, &[&owner, &repo])
-        .and_then(|p| resolve_within_root(&state.cfg.repo_scan_path, &p))
-        .ok_or(StatusCode::NOT_FOUND)?;
+    let repo_path = resolve_repo_path(&state, &owner, &repo).await?;
 
-    // Remove via canonical path; resolve_within_root already confirmed containment.
+    // Remove via canonical path; resolve_repo_path confirmed containment.
     std::fs::remove_dir_all(&repo_path).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     // Remove from database
-    let owner_did = format!("did:plc:{}", owner);
-    if let Ok(alias) = state.db.find_repo_alias(&owner_did, &repo).await {
-        let _ = state.db.delete_repo(&alias.repo_did).await;
+    let owner_did = normalize_owner_did(&owner);
+    if let Ok(repo_did) = state.db.get_repo_did_by_name(&owner_did, &repo).await {
+        let _ = state.db.delete_repo(&repo_did).await;
     }
 
     tracing::info!("deleted repo {}/{}", owner, repo);

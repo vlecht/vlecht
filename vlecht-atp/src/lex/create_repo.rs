@@ -63,9 +63,10 @@ pub async fn handler(
         .await
         .map_err(|e| XrpcError::InternalServerError(e.to_string()))?;
 
-    // Create repo on disk (path = <owner>/<rkey>). join_safe rejects any
-    // segment that could escape the scan root via `..` or separators.
-    let repo_path = join_safe(&state.repo_scan_path, &[&actor_did, &body.rkey])
+    // Create repo on disk at the canonical layout: bare repo directly under
+    // its repo DID dir (Go parity — imported repos live here too). join_safe
+    // rejects any segment that could escape the scan root via `..`.
+    let repo_path = join_safe(&state.repo_scan_path, &[&repo_did])
         .ok_or_else(|| XrpcError::InvalidRequest("invalid repository path".into()))?;
     let parent = repo_path
         .parent()
@@ -93,7 +94,10 @@ pub async fn handler(
     Ok(Json(json!({ "repoDid": repo_did })))
 }
 
-fn validate_repo_name(name: &str) -> Result<(), XrpcError> {
+/// Validate a repo name for on-disk safety. Exported so the HTTP create
+/// endpoint (which keys the directory off the name-derived repo DID) can
+/// apply the same rules as the XRPC endpoint.
+pub fn validate_repo_name(name: &str) -> Result<(), XrpcError> {
     if name.is_empty() {
         return Err(XrpcError::InvalidRequest(
             "repository name is required".into(),

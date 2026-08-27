@@ -75,9 +75,17 @@ async fn resolve_inner(
     }
 
     if !input.contains('/') {
-        // Bare DID form: alias lookup, then on-disk under scan_path/<did>.
+        // Bare DID form: alias lookup first, then the DID dir itself.
         if let Ok((owner_did, rkey)) = state.db.get_repo_key_owner(input).await {
             if is_safe_segment(&owner_did) && is_safe_segment(&rkey) {
+                // Canonical layout: bare repo directly under its repo DID
+                // dir (Go parity — imported repos live here).
+                let p = state.repo_scan_path.join(input);
+                if let Some(canon) = resolve_within_root(&state.repo_scan_path, &p) {
+                    if canon.exists() {
+                        return Ok((canon, Some((input.to_string(), owner_did))));
+                    }
+                }
                 if let Some(p) = join_safe(&state.repo_scan_path, &[&owner_did, &rkey]) {
                     if let Some(canon) = resolve_within_root(&state.repo_scan_path, &p) {
                         if canon.exists() {
@@ -104,6 +112,8 @@ async fn resolve_inner(
     if is_safe_segment(owner_did) && is_safe_segment(rkey) {
         if let Ok(repo_did) = state.db.get_repo_did_by_name(owner_did, rkey).await {
             if is_safe_segment(&repo_did) {
+                // Canonical layout: bare repo directly under its repo DID
+                // dir (Go parity — imported repos live here).
                 let p = state.repo_scan_path.join(&repo_did);
                 if let Some(canon) = resolve_within_root(&state.repo_scan_path, &p) {
                     if canon.exists() {

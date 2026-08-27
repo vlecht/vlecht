@@ -115,6 +115,25 @@ pub async fn git_push_auth(
     }
 }
 
+/// Normalize an owner path segment to a full DID.
+///
+/// SSH paths and Tangled appview URLs carry the full `did:plc:...`, while
+/// vlecht's own HTTP routes use a short owner name. Don't double-prefix
+/// DIDs that arrive already complete.
+pub fn normalize_owner_did(owner: &str) -> String {
+    if owner.starts_with("did:") {
+        owner.to_owned()
+    } else {
+        format!("did:plc:{owner}")
+    }
+}
+
+/// Normalize a repo name for DB lookup: git clients commonly address repos
+/// with a `.git` suffix that the DB alias never carries.
+pub fn normalize_repo_name(repo: &str) -> &str {
+    repo.strip_suffix(".git").unwrap_or(repo)
+}
+
 /// Check that the requesting DID owns the repo at `/{owner}/{repo}`.
 ///
 /// Looks up the repo alias (owner_did + rkey) and verifies the owner matches.
@@ -125,7 +144,8 @@ pub async fn assert_push_auth(
     repo: &str,
     did: &str,
 ) -> Result<(), StatusCode> {
-    let expected_did = format!("did:plc:{owner}");
+    let expected_did = normalize_owner_did(owner);
+    let repo = normalize_repo_name(repo);
 
     // Banned accounts forfeit all repo access except the knot admin's own.
     if did != state.atp.owner_did && state.db.is_banned(did).await.unwrap_or(true) {
@@ -183,7 +203,8 @@ pub async fn assert_read_auth(
     repo: &str,
     did: Option<&str>,
 ) -> Result<(), StatusCode> {
-    let owner_did = format!("did:plc:{owner}");
+    let owner_did = normalize_owner_did(owner);
+    let repo = normalize_repo_name(repo);
 
     let Ok(repo_did) = state.db.get_repo_did_by_name(&owner_did, repo).await else {
         // No DB record — untracked disk repo, treated as public.

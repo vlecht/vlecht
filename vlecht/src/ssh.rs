@@ -297,6 +297,25 @@ impl russh::server::Handler for GitSession {
             return Ok(());
         };
 
+        // Single-segment bare-DID form: the repo DID identifies the repo
+        // directly; look up its (owner, rkey) alias for the auth checks.
+        let (owner, repo_name) = if repo_name.is_empty() {
+            match derive_repo_owner(&self.state, &owner).await {
+                Some((owner_did, rkey)) => (owner_did, rkey),
+                None => {
+                    session.extended_data(
+                        channel_id,
+                        1,
+                        Vec::from(b"repository not found\n" as &[u8]),
+                    )?;
+                    session.close(channel_id)?;
+                    return Ok(());
+                }
+            }
+        } else {
+            (owner.clone(), repo_name.clone())
+        };
+
         // Private repos: only owner and space members may clone/fetch.
         if command == "git-upload-pack"
             && crate::auth::assert_read_auth(
@@ -694,6 +713,13 @@ fn parse_git_command(cmd: &str) -> Option<(&str, String)> {
 
 fn parse_owner_repo(path: &str) -> Option<(String, String)> {
     let path = path.trim_start_matches('/');
+    // Single-segment form: a bare repo DID (Go parity — Tangled clients
+    // emit `ssh://git@knot/<repo-did>.git` for aliases with unknown rkeys).
+    if let Some(repo_did) = path.strip_suffix(".git").filter(|s| s.starts_with("did:")) {
+        if !repo_did.contains('/') {
+            return Some((repo_did.to_owned(), String::new()));
+        }
+    }
     let (owner, repo) = path.split_once('/')?;
     let repo = repo.trim_end_matches(".git");
     if owner.is_empty() || repo.is_empty() {
@@ -714,30 +740,12 @@ fn normalize_pubkey(s: &str) -> Option<String> {
     Some(format!("{algo} {blob}"))
 }
 
-async fn resolve_repo_path(state: &AppState, owner: &str, repo: &str) -> Option<PathBuf> {
-    use vlecht_git::paths::{is_safe_segment, join_safe, resolve_within_root};
-    if !is_safe_segment(owner) || !is_safe_segment(repo) {
-        return None;
-    }
-    let root = &state.cfg.repo_scan_path;
-    // Aliases are stored with full DIDs; SSH paths carry the short owner name.
-    let owner_did = format!("did:plc:{owner}");
-    if let Ok(alias) = state.db.find_repo_alias(&owner_did, repo).await {
-        if is_safe_segment(&alias.repo_did) {
-            let candidate = root.join(&alias.repo_did);
-            if let Some(canon) = resolve_within_root(root, &candidate) {
-                if canon.join("HEAD").exists() {
-                    return Some(canon);
-                }
-            }
-        }
-    }
+/// Resolve a bare repo DID to `(owner_did, rkey)` via the DB. Returns None
+/// for untracked DIDs — the bare form only makes sense for DB-tracked repos.
+async fn derive_repo_owner(state: &AppState, repo_did: &str) -> Option<(String, String)> {
+    state.db.get_repo_key_owner(repo_did).await.ok()
+}
 
-    let legacy = join_safe(root, &[owner, repo])?;
-    let canon = resolve_within_root(root, &legacy)?;
-    if canon.join("HEAD").exists() {
-        Some(canon)
-    } else {
-        None
-    }
+async fn resolve_repo_path(state: &AppState, owner: &str, repo: &str) -> Option<PathBuf> {
+    crate::resolve::resolve_repo_path(state, owner, repo).await
 }

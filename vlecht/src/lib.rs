@@ -2,6 +2,7 @@ pub mod auth;
 pub mod config;
 pub mod handlers;
 pub mod middleware;
+pub mod resolve;
 pub mod ssh;
 
 use axum::{

@@ -21,6 +21,13 @@ fn unique_port() -> u16 {
     NEXT_PORT.fetch_add(1, Ordering::SeqCst)
 }
 
+/// On-disk path of a repo created via the XRPC create endpoint: bare repo
+/// directly under its derived repo DID dir (canonical Go-parity layout).
+fn created_repo_path(server: &ServerHandle, rkey: &str) -> PathBuf {
+    let repo_did = vlecht_atp::lex::derive_repo_did("did:plc:testowner", rkey);
+    server.tmpdir.join("repos").join(repo_did)
+}
+
 fn test_dir(pid: u32, label: &str) -> PathBuf {
     let mut p = std::env::temp_dir();
     p.push(format!("vlecht_atp_xrpc_{}_{}", label, pid));
@@ -1319,11 +1326,7 @@ async fn xrpc_write_create_repo() {
     assert!(repo_did.starts_with("did:plc:"));
 
     // Repo should exist on disk
-    let repo_path = server
-        .tmpdir
-        .join("repos")
-        .join("did:plc:testowner")
-        .join("my-repo");
+    let repo_path = created_repo_path(&server, "my-repo");
     assert!(
         repo_path.exists(),
         "repo not created on disk at {repo_path:?}"
@@ -1391,11 +1394,7 @@ async fn xrpc_write_delete_repo() {
     assert_eq!(status, 200, "body={body}");
 
     // Repo should be gone from disk
-    let repo_path = server
-        .tmpdir
-        .join("repos")
-        .join("did:plc:testowner")
-        .join("to-delete");
+    let repo_path = created_repo_path(&server, "to-delete");
     assert!(!repo_path.exists());
 }
 
@@ -1464,11 +1463,7 @@ async fn xrpc_write_delete_branch() {
     let _repo_did = create_body["repoDid"].as_str().unwrap();
 
     // Push a second branch via the git CLI
-    let repo_path = server
-        .tmpdir
-        .join("repos")
-        .join("did:plc:testowner")
-        .join("del-branch");
+    let repo_path = created_repo_path(&server, "del-branch");
     let wd = server.workdir("del_branch_work");
     let local = wd.join("local");
     std::fs::create_dir_all(&local).unwrap();
@@ -1578,11 +1573,7 @@ async fn xrpc_merge_check_fast_forwardable() {
     let _repo_did = create_body["repoDid"].as_str().unwrap();
 
     // Push some commits
-    let repo_path = server
-        .tmpdir
-        .join("repos")
-        .join("did:plc:testowner")
-        .join("merge-ff");
+    let repo_path = created_repo_path(&server, "merge-ff");
     let wd = server.workdir("merge_ff_work");
     let local = wd.join("local");
     std::fs::create_dir_all(&local).unwrap();
@@ -1627,11 +1618,7 @@ async fn xrpc_merge_fast_forward() {
         )
         .await;
 
-    let repo_path = server
-        .tmpdir
-        .join("repos")
-        .join("did:plc:testowner")
-        .join("merge-ff2");
+    let repo_path = created_repo_path(&server, "merge-ff2");
     let wd = server.workdir("merge_ff2_work");
     let local = wd.join("local");
     std::fs::create_dir_all(&local).unwrap();
@@ -1676,11 +1663,7 @@ async fn xrpc_hidden_ref_set_and_get() {
         .await;
     let _repo_did = create_body["repoDid"].as_str().unwrap();
 
-    let repo_path = server
-        .tmpdir
-        .join("repos")
-        .join("did:plc:testowner")
-        .join("hidden-test");
+    let repo_path = created_repo_path(&server, "hidden-test");
     let wd = server.workdir("hidden_work");
     let local = wd.join("local");
     std::fs::create_dir_all(&local).unwrap();
@@ -1720,11 +1703,7 @@ async fn xrpc_fork_status_up_to_date() {
         )
         .await;
 
-    let repo_path = server
-        .tmpdir
-        .join("repos")
-        .join("did:plc:testowner")
-        .join("fork-status");
+    let repo_path = created_repo_path(&server, "fork-status");
     let wd = server.workdir("fork_status_work");
     let local = wd.join("local");
     std::fs::create_dir_all(&local).unwrap();

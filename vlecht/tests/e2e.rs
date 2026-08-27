@@ -632,8 +632,10 @@ async fn e2e_create_and_push_to_new_repo() {
     );
     git_push(&local, &["push", "origin", "main"], "did:plc:bob");
 
+    let owner_did = "did:plc:bob";
+    let repo_did = vlecht_atp::lex::derive_repo_did(owner_did, "newrepo");
     let repo =
-        vlecht_git::GitRepo::open(&server.tmpdir.join("repos").join("bob").join("newrepo")).unwrap();
+        vlecht_git::GitRepo::open(&server.tmpdir.join("repos").join(&repo_did)).unwrap();
     let commits = repo.commits("main", 0, 10).unwrap();
     assert_eq!(commits.len(), 1);
     assert!(commits[0].message.contains("first"));
@@ -1410,4 +1412,149 @@ async fn e2e_banned_owner_push_denied() {
     // Unban — push works again.
     server.db.unban_account("did:plc:alice").await.unwrap();
     git_push(&local, &["push", &url, "main"], "did:plc:alice");
+}
+
+// ---------------------------------------------------------------------------
+// Repo path resolution regressions
+//
+// Imported Go-knotserver repos live at <scan_path>/<repo_did> (the bare repo
+// directly under its DID dir), and Tangled clients address them with full
+// DIDs in the URL. These tests pin the owner normalization (no
+// `did:plc:did:plc:` double-prefix) and the DID-dir layout lookup.
+// ---------------------------------------------------------------------------
+
+/// Seed a repo in the canonical DID-dir layout and register its DB alias.
+async fn seed_did_dir_repo(server: &ServerHandle, owner: &str, name: &str) -> PathBuf {
+    let owner_did = format!("did:plc:{owner}");
+    let repo_did = vlecht_atp::lex::derive_repo_did(&owner_did, name);
+    let path = server.tmpdir.join("repos").join(&repo_did);
+    std::fs::create_dir_all(&path).unwrap();
+    vlecht_git::GitRepo::init_bare(&path, "main").unwrap();
+    server.db.add_did(&owner_did).await.unwrap();
+    server
+        .db
+        .create_repo(&repo_did, None, &owner_did, name, "k256")
+        .await
+        .unwrap();
+    path
+}
+
+/// SSH fetch with the full owner DID in the URL (how Tangled clients and
+/// imported repos are addressed) against a DID-dir-layout repo.
+#[tokio::test(flavor = "multi_thread")]
+async fn ssh_git_full_did_owner_did_dir_layout() {
+    let http_port = unique_port();
+    let ssh_port = unique_port();
+    let server = ServerHandle::start(http_port, Some(ssh_port)).await;
+    let ssh_cmd = server.ssh_command();
+    let repo_path = seed_did_dir_repo(&server, "alice", "didowned").await;
+
+    let wd = server.workdir("ssh_did_dir_work");
+    let src = wd.join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    git(&src, &["init"]);
+    std::fs::write(src.join("f.txt"), "did-dir\n").unwrap();
+    git(&src, &["add", "."]);
+    git(&src, &["commit", "-m", "init"]);
+    git(&src, &["remote", "add", "origin", repo_path.to_str().unwrap()]);
+    git(&src, &["push", "origin", "main"]);
+
+    // Full DID owner, .git suffix: the exact URL shape from the live bug.
+    let remote = server.ssh_url("did:plc:alice", "didowned.git");
+    let out = git_ssh_output(&wd, &["ls-remote", &remote], &ssh_cmd);
+    assert!(out.contains("refs/heads/main"), "ls-remote: {out}");
+
+    // Single-segment bare repo-DID form (no owner/rkey at all).
+    let repo_did = vlecht_atp::lex::derive_repo_did("did:plc:alice", "didowned");
+    let bare = format!("ssh://git@127.0.0.1:{}/{}.git", server.ssh_port, repo_did);
+    let out = git_ssh_output(&wd, &["ls-remote", &bare], &ssh_cmd);
+    assert!(out.contains("refs/heads/main"), "ls-remote: {out}");
+
+    // Short owner name still resolves against the DID-dir layout.
+    let out = git_ssh_output(
+        &wd,
+        &["ls-remote", &server.ssh_url("alice", "didowned.git")],
+        &ssh_cmd,
+    );
+    assert!(out.contains("refs/heads/main"), "ls-remote: {out}");
+}
+
+/// HTTP fetch with the full owner DID in the URL (Go appview shape) against
+/// a DID-dir-layout repo.
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_http_full_did_owner_did_dir_layout() {
+    let port = unique_port();
+    let server = ServerHandle::start(port, None).await;
+    let repo_path = seed_did_dir_repo(&server, "alice", "httpdid").await;
+
+    let wd = server.workdir("http_did_dir_work");
+    let src = wd.join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    git(&src, &["init"]);
+    std::fs::write(src.join("f.txt"), "http-did-dir\n").unwrap();
+    git(&src, &["add", "."]);
+    git(&src, &["commit", "-m", "init"]);
+    git(&src, &["remote", "add", "origin", repo_path.to_str().unwrap()]);
+    git(&src, &["push", "origin", "main"]);
+
+    let out = git_output(
+        &wd,
+        &["ls-remote", &server.http_url("did:plc:alice", "httpdid.git")],
+    );
+    assert!(out.contains("refs/heads/main"), "ls-remote: {out}");
+}
+
+/// A private repo addressed with a `.git` suffix must still be treated as
+/// private — the auth layer normalizes the suffix before the DB lookup.
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_private_repo_git_suffix_denied() {
+    let port = unique_port();
+    let server = ServerHandle::start(port, None).await;
+    let repo_path = seed_did_dir_repo(&server, "alice", "privgit").await;
+
+    let repo_did = vlecht_atp::lex::derive_repo_did("did:plc:alice", "privgit");
+    server
+        .db
+        .set_repo_visibility(&repo_did, "private")
+        .await
+        .unwrap();
+    vlecht_git::GitRepo::open(&repo_path).unwrap().commits("main", 0, 1).ok();
+
+    let wd = server.workdir("priv_git_suffix_work");
+    for url in [
+        server.http_url("alice", "privgit.git"),
+        server.http_url("did:plc:alice", "privgit.git"),
+    ] {
+        let stderr = git_fail(&wd, &["ls-remote", &url], None);
+        assert!(
+            stderr.contains("not found") || stderr.contains("404"),
+            "{stderr}"
+        );
+    }
+}
+
+/// Pushing over SSH with the full owner DID must resolve and authorize
+/// against the normalized DID (regression for the did:plc:did:plc: prefix).
+#[tokio::test(flavor = "multi_thread")]
+async fn ssh_git_push_full_did_owner() {
+    let http_port = unique_port();
+    let ssh_port = unique_port();
+    let server = ServerHandle::start(http_port, Some(ssh_port)).await;
+    let ssh_cmd = server.ssh_command();
+    let repo_path = seed_did_dir_repo(&server, "alice", "pushdid").await;
+
+    let wd = server.workdir("ssh_push_did_work");
+    let local = wd.join("local");
+    std::fs::create_dir_all(&local).unwrap();
+    git(&local, &["init"]);
+    std::fs::write(local.join("f.txt"), "push-did\n").unwrap();
+    git(&local, &["add", "."]);
+    git(&local, &["commit", "-m", "init"]);
+
+    let remote = server.ssh_url("did:plc:alice", "pushdid.git");
+    git_ssh(&local, &["push", &remote, "main"], &ssh_cmd);
+
+    let repo = vlecht_git::GitRepo::open(&repo_path).unwrap();
+    let commits = repo.commits("main", 0, 10).unwrap();
+    assert_eq!(commits.len(), 1);
 }
