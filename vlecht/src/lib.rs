@@ -25,6 +25,8 @@ pub struct AppState {
     pub identity: Arc<vlecht_atp::identity::AtpIdentity>,
     /// TTL cache for PDS `sh.tangled.publicKey` lookups (SSH auth).
     pub pds_key_cache: tokio::sync::Mutex<std::collections::HashMap<String, PdsKeyCache>>,
+    /// TTL cache for handle → DID resolutions (git transport owner paths).
+    pub handle_cache: tokio::sync::Mutex<std::collections::HashMap<String, HandleCache>>,
 }
 
 /// Cached outcome of a PDS pubkey lookup.
@@ -34,6 +36,8 @@ pub enum PdsKeyCache {
     /// `(fresh_until)` — resolution or transport failed; retry later.
     Miss(std::time::Instant),
 }
+
+pub use auth::HandleCache;
 
 /// Build the application router with all routes and state.
 ///
@@ -173,5 +177,6 @@ pub fn build_state(db: Db, cfg: Arc<config::Config>) -> Arc<AppState> {
         atp_service_auth: Arc::new(service_auth),
         identity,
         pds_key_cache: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+        handle_cache: tokio::sync::Mutex::new(std::collections::HashMap::new()),
     })
 }

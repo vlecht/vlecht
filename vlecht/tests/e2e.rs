@@ -1464,11 +1464,16 @@ async fn ssh_git_full_did_owner_did_dir_layout() {
     let out = git_ssh_output(&wd, &["ls-remote", &remote], &ssh_cmd);
     assert!(out.contains("refs/heads/main"), "ls-remote: {out}");
 
-    // Single-segment bare repo-DID form (no owner/rkey at all).
+    // Single-segment bare repo-DID form, both with and without the `.git`
+    // suffix (Tangled emits the latter for repo-DID remotes).
     let repo_did = vlecht_atp::lex::derive_repo_did("did:plc:alice", "didowned");
-    let bare = format!("ssh://git@127.0.0.1:{}/{}.git", server.ssh_port, repo_did);
-    let out = git_ssh_output(&wd, &["ls-remote", &bare], &ssh_cmd);
-    assert!(out.contains("refs/heads/main"), "ls-remote: {out}");
+    for bare in [
+        format!("ssh://git@127.0.0.1:{}/{}.git", server.ssh_port, repo_did),
+        format!("ssh://git@127.0.0.1:{}/{}", server.ssh_port, repo_did),
+    ] {
+        let out = git_ssh_output(&wd, &["ls-remote", &bare], &ssh_cmd);
+        assert!(out.contains("refs/heads/main"), "ls-remote: {out}");
+    }
 
     // Short owner name still resolves against the DID-dir layout.
     let out = git_ssh_output(

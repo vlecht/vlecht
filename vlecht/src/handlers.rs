@@ -1,4 +1,4 @@
-use crate::auth::{assert_push_auth, assert_read_auth, normalize_owner_did, Did, MaybeDid};
+use crate::auth::{assert_push_auth, assert_read_auth, Did, MaybeDid};
 use crate::AppState;
 use axum::{
     body::Body,
@@ -452,7 +452,7 @@ pub async fn delete_repo(
     std::fs::remove_dir_all(&repo_path).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     // Remove from database
-    let owner_did = normalize_owner_did(&owner);
+    let owner_did = crate::auth::resolve_owner_did(&state, &owner).await;
     if let Ok(repo_did) = state.db.get_repo_did_by_name(&owner_did, &repo).await {
         let _ = state.db.delete_repo(&repo_did).await;
     }

@@ -5,7 +5,6 @@
 //! 2. `<scan_path>/<owner_did>/<repo>` — legacy full-DID
 //! 3. `<scan_path>/<owner>/<repo>` — legacy short owner name
 
-use crate::auth::normalize_owner_did;
 use crate::AppState;
 use std::path::PathBuf;
 use vlecht_db::RepoStore;
@@ -32,7 +31,7 @@ pub(crate) async fn resolve_repo_path(
     // suffix; the DB alias and on-disk dir never carry it.
     let repo = repo.strip_suffix(".git").unwrap_or(repo);
 
-    let owner_did = normalize_owner_did(owner);
+    let owner_did = crate::auth::resolve_owner_did(state, owner).await;
     if let Ok(repo_did) = state.db.get_repo_did_by_name(&owner_did, repo).await {
         if is_safe_segment(&repo_did) {
             let candidate = root.join(&repo_did);

@@ -115,23 +115,85 @@ pub async fn git_push_auth(
     }
 }
 
-/// Normalize an owner path segment to a full DID.
-///
-/// SSH paths and Tangled appview URLs carry the full `did:plc:...`, while
-/// vlecht's own HTTP routes use a short owner name. Don't double-prefix
-/// DIDs that arrive already complete.
-pub fn normalize_owner_did(owner: &str) -> String {
-    if owner.starts_with("did:") {
-        owner.to_owned()
-    } else {
-        format!("did:plc:{owner}")
-    }
-}
-
 /// Normalize a repo name for DB lookup: git clients commonly address repos
 /// with a `.git` suffix that the DB alias never carries.
 pub fn normalize_repo_name(repo: &str) -> &str {
     repo.strip_suffix(".git").unwrap_or(repo)
+}
+
+/// Cached outcome of a handle → DID resolution.
+pub enum HandleCache {
+    /// `(did, fresh_until)`
+    Hit(String, std::time::Instant),
+    /// `(fresh_until)` — resolution failed; retry later.
+    Miss(std::time::Instant),
+}
+
+/// Positive/negative TTLs for handle resolutions. Positive entries live
+/// long (handles are stable); failures retry sooner.
+const HANDLE_POS_TTL: std::time::Duration = std::time::Duration::from_secs(300);
+const HANDLE_NEG_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+
+pub async fn resolve_owner_did(state: &AppState, owner: &str) -> String {
+    if owner.starts_with("did:") {
+        return owner.to_owned();
+    }
+    if !owner.contains('.') {
+        return format!("did:plc:{owner}");
+    }
+
+    // Cached resolution.
+    if let Some(cached) = state.handle_cache.lock().await.get(owner) {
+        match cached {
+            HandleCache::Hit(did, until) if *until > std::time::Instant::now() => {
+                return did.clone();
+            }
+            HandleCache::Miss(until) if *until > std::time::Instant::now() => {
+                return format!("did:plc:{owner}");
+            }
+            _ => {}
+        }
+    }
+
+    // Network: atproto handle → DID.
+    let handle: jacquard_common::types::string::Handle =
+        match jacquard_common::types::string::Handle::new_owned(owner) {
+            Ok(h) => h,
+            Err(_) => {
+                let mut cache = state.handle_cache.lock().await;
+                cache.insert(
+                    owner.to_owned(),
+                    HandleCache::Miss(std::time::Instant::now() + HANDLE_NEG_TTL),
+                );
+                return format!("did:plc:{owner}");
+            }
+        };
+    use jacquard_identity::resolver::IdentityResolver;
+    let resolved = state
+        .identity
+        .resolver
+        .resolve_handle(&handle)
+        .await
+        .ok()
+        .map(|d| d.to_string());
+
+    let mut cache = state.handle_cache.lock().await;
+    match resolved {
+        Some(did) => {
+            cache.insert(
+                owner.to_owned(),
+                HandleCache::Hit(did.clone(), std::time::Instant::now() + HANDLE_POS_TTL),
+            );
+            did
+        }
+        None => {
+            cache.insert(
+                owner.to_owned(),
+                HandleCache::Miss(std::time::Instant::now() + HANDLE_NEG_TTL),
+            );
+            format!("did:plc:{owner}")
+        }
+    }
 }
 
 /// Check that the requesting DID owns the repo at `/{owner}/{repo}`.
@@ -144,7 +206,7 @@ pub async fn assert_push_auth(
     repo: &str,
     did: &str,
 ) -> Result<(), StatusCode> {
-    let expected_did = normalize_owner_did(owner);
+    let expected_did = resolve_owner_did(state, owner).await;
     let repo = normalize_repo_name(repo);
 
     // Banned accounts forfeit all repo access except the knot admin's own.
@@ -203,7 +265,7 @@ pub async fn assert_read_auth(
     repo: &str,
     did: Option<&str>,
 ) -> Result<(), StatusCode> {
-    let owner_did = normalize_owner_did(owner);
+    let owner_did = resolve_owner_did(state, owner).await;
     let repo = normalize_repo_name(repo);
 
     let Ok(repo_did) = state.db.get_repo_did_by_name(&owner_did, repo).await else {

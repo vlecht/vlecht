@@ -713,15 +713,17 @@ fn parse_git_command(cmd: &str) -> Option<(&str, String)> {
 
 fn parse_owner_repo(path: &str) -> Option<(String, String)> {
     let path = path.trim_start_matches('/');
-    // Single-segment form: a bare repo DID (Go parity — Tangled clients
-    // emit `ssh://git@knot/<repo-did>.git` for aliases with unknown rkeys).
-    if let Some(repo_did) = path.strip_suffix(".git").filter(|s| s.starts_with("did:")) {
-        if !repo_did.contains('/') {
-            return Some((repo_did.to_owned(), String::new()));
+    let path = path.strip_suffix(".git").unwrap_or(path);
+    // Single-segment form: a bare repo DID, with or without the `.git`
+    // suffix (Go parity — Tangled clients emit `ssh://git@knot/<repo-did>`
+    // when the owner/rkey pair is unknown).
+    if !path.contains('/') {
+        if path.starts_with("did:") {
+            return Some((path.to_owned(), String::new()));
         }
+        return None;
     }
     let (owner, repo) = path.split_once('/')?;
-    let repo = repo.trim_end_matches(".git");
     if owner.is_empty() || repo.is_empty() {
         return None;
     }
