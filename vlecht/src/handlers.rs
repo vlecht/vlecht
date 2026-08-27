@@ -340,12 +340,19 @@ pub async fn receive_pack(
 ) -> Result<Response, StatusCode> {
     assert_push_auth(&state, &owner, &repo, &did.0).await?;
 
-    let git_repo = open_repo(&state, &owner, &repo).await?;
-    let decompressed = maybe_decompress(&headers, &body);
+    let (data, changes) = {
+        // Keep the gix handle scoped: it isn't Send and must not cross
+        // the emit await below.
+        let git_repo = open_repo(&state, &owner, &repo).await?;
+        let decompressed = maybe_decompress(&headers, &body);
+        git_repo
+            .receive_pack(&decompressed)
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    };
 
-    let data = git_repo
-        .receive_pack(&decompressed)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    if !changes.is_empty() {
+        crate::events::emit_ref_updates(&state, &did.0, &owner, &repo, &changes).await;
+    }
 
     Ok(Response::builder()
         .header(
@@ -422,6 +429,8 @@ pub async fn create_repo(
         .create_repo(&repo_did, None, &owner_did, &body.name, "k256")
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    crate::events::emit_did_assign(&state, &owner_did, &body.name, &repo_did).await;
 
     if let Some(vis) = body.visibility.as_deref() {
         state

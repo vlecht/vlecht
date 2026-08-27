@@ -1200,6 +1200,7 @@ impl AuthServer {
             owner_did: TEST_ISSUER_DID.to_string(),
             repo_scan_path: repo_scan,
             audience_did: TEST_AUDIENCE_DID.to_string(),
+            events_tx: tokio::sync::broadcast::channel(4).0,
         };
 
         let sa_cfg_clone = sa_cfg.clone().unwrap();

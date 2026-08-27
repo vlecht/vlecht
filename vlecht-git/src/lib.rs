@@ -68,6 +68,17 @@ pub struct SubmoduleInfo {
 // Repo handle
 // ---------------------------------------------------------------------------
 
+/// A ref that changed during `receive_pack`. Returned alongside the wire
+/// response so transports can emit firehose events.
+#[derive(Debug, Clone)]
+pub struct RefChange {
+    pub refname: String,
+    /// Hex sha before; `None` = ref was created.
+    pub old_sha: Option<String>,
+    /// Hex sha after; `None` = ref was deleted.
+    pub new_sha: Option<String>,
+}
+
 pub struct GitRepo {
     inner: gix::Repository,
     path: PathBuf,
@@ -545,7 +556,13 @@ impl GitRepo {
     ///
     /// `request_body` is the full client request (pkt-line commands + optional pack data).
     /// Returns a report-status response.
-    pub fn receive_pack(&self, request_body: &[u8]) -> Result<Vec<u8>, GitError> {
+    /// Receive a push: ingest the pack and update refs. Returns the raw
+    /// report-status response PLUS the per-ref changes that succeeded, so
+    /// callers can emit firehose events for them.
+    pub fn receive_pack(
+        &self,
+        request_body: &[u8],
+    ) -> Result<(Vec<u8>, Vec<RefChange>), GitError> {
         let (commands, pack_data) = split_receive_pack(request_body)?;
 
         let zero_oid = zero_oid_for_kind(self.inner.object_hash());
@@ -557,6 +574,7 @@ impl GitRepo {
 
         // Update refs based on commands
         let mut reports = Vec::new();
+        let mut changes = Vec::new();
         for cmd in &commands {
             // Enforce ref-namespace policy: clients may only push to
             // refs/heads/* and refs/tags/*. Other namespaces (refs/hidden/,
@@ -586,12 +604,20 @@ impl GitRepo {
                         .map_err(|e| GitError::Protocol(format!("invalid new sha: {e}")))?,
                 )
             };
+            let change = RefChange {
+                refname: cmd.refname.clone(),
+                old_sha: if cmd.old_sha == zero_oid { None } else { Some(cmd.old_sha.clone()) },
+                new_sha: if cmd.new_sha == zero_oid { None } else { Some(cmd.new_sha.clone()) },
+            };
 
             // Delete ref
             if new_oid.is_none() {
                 if let Some(old) = old_oid {
                     match self.delete_ref(&cmd.refname, old) {
-                        Ok(()) => reports.push(format!("ok {}\n", cmd.refname)),
+                        Ok(()) => {
+                            reports.push(format!("ok {}\n", cmd.refname));
+                            changes.push(change);
+                        }
                         Err(e) => reports.push(format!("ng {} {}\n", cmd.refname, e)),
                     }
                 } else {
@@ -610,7 +636,10 @@ impl GitRepo {
 
             // Create or update ref
             match self.update_ref(&cmd.refname, old_oid, new_oid) {
-                Ok(()) => reports.push(format!("ok {}\n", cmd.refname)),
+                Ok(()) => {
+                    reports.push(format!("ok {}\n", cmd.refname));
+                    changes.push(change);
+                }
                 Err(e) => reports.push(format!("ng {} {}\n", cmd.refname, e)),
             }
         }
@@ -630,7 +659,7 @@ impl GitRepo {
         sideband.extend_from_slice(&report_lines);
         sideband.extend_from_slice(pkt_flush());
 
-        Ok(sideband)
+        Ok((sideband, changes))
     }
 
     fn ingest_thin_pack(&self, pack_data: &[u8]) -> Result<(), GitError> {

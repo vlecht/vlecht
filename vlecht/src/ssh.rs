@@ -376,9 +376,22 @@ impl russh::server::Handler for GitSession {
         let handle = session.handle();
         let mut stream = channel.into_stream();
 
+        let auth_did = self.auth_did.clone().unwrap_or_default();
         let command = command.to_owned();
+        let state = self.state.clone();
+        let subject_owner = owner.clone();
+        let subject_repo = repo_name.clone();
         tokio::spawn(async move {
-            let result = handle_git_command(&mut stream, &repo_path, &command).await;
+            let result = handle_git_command(
+                &mut stream,
+                &repo_path,
+                &command,
+                &state,
+                &auth_did,
+                &subject_owner,
+                &subject_repo,
+            )
+            .await;
 
             let code = if result.is_ok() { 0 } else { 1 };
             if let Err(ref e) = result {
@@ -409,10 +422,14 @@ async fn handle_git_command(
     stream: &mut ChannelStream<Msg>,
     repo_path: &PathBuf,
     command: &str,
+    state: &Arc<crate::AppState>,
+    auth_did: &str,
+    owner: &str,
+    repo: &str,
 ) -> Result<(), anyhow::Error> {
     match command {
         "git-upload-pack" => handle_upload_pack(stream, repo_path).await,
-        "git-receive-pack" => handle_receive_pack(stream, repo_path).await,
+        "git-receive-pack" => handle_receive_pack(stream, repo_path, state, auth_did, owner, repo).await,
         _ => {
             stream.write_all(b"unsupported command\n").await?;
             Ok(())
@@ -457,6 +474,10 @@ async fn handle_upload_pack(
 async fn handle_receive_pack(
     stream: &mut ChannelStream<Msg>,
     repo_path: &PathBuf,
+    state: &Arc<crate::AppState>,
+    auth_did: &str,
+    owner: &str,
+    repo: &str,
 ) -> Result<(), anyhow::Error> {
     // Phase 1: send ref advertisement (v1, no HTTP service header)
     let adv = {
@@ -483,10 +504,13 @@ async fn handle_receive_pack(
     }
 
     // Phase 3: process and send report-status response
-    let response = {
+    let (response, changes) = {
         let repo = GitRepo::open(repo_path)?;
         repo.receive_pack(&request_data)?
     };
+    if !changes.is_empty() {
+        crate::events::emit_ref_updates(state, auth_did, owner, repo, &changes).await;
+    }
     stream.write_all(&response).await?;
 
     Ok(())

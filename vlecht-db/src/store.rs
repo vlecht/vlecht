@@ -133,6 +133,15 @@ pub trait RepoStore {
 
     /// List all known DIDs.
     async fn get_all_dids(&self) -> Result<Vec<String>, DbError>;
+
+    // --- events (/events firehose) ---
+
+    /// Insert one event row. `ev.event` must already be serialized JSON.
+    async fn insert_event(&self, ev: &crate::repo::EventRow) -> Result<(), DbError>;
+
+    /// Fetch up to `limit` events with `created > cursor`, oldest first.
+    /// Matches Go `eventstream.List`.
+    async fn get_events(&self, cursor: i64, limit: i64) -> Result<Vec<crate::repo::EventRow>, DbError>;
 }
 
 // --- SQLite implementation ---
@@ -542,6 +551,38 @@ impl RepoStore for Db {
             .iter()
             .map(|r| r.try_get("did").unwrap_or_default())
             .collect())
+    }
+
+    async fn insert_event(&self, ev: &crate::repo::EventRow) -> Result<(), DbError> {
+        sqlx::query("INSERT INTO events (rkey, nsid, event, created) VALUES (?, ?, ?, ?)")
+            .bind(&ev.rkey)
+            .bind(&ev.nsid)
+            .bind(&ev.event)
+            .bind(ev.created)
+            .execute(self.pool())
+            .await?;
+        Ok(())
+    }
+
+    async fn get_events(&self, cursor: i64, limit: i64) -> Result<Vec<crate::repo::EventRow>, DbError> {
+        let rows = sqlx::query(
+            "SELECT rkey, nsid, event, created FROM events WHERE created > ? ORDER BY created ASC LIMIT ?",
+        )
+        .bind(cursor)
+        .bind(limit)
+        .fetch_all(self.pool())
+        .await?;
+
+        rows.iter()
+            .map(|r| {
+                Ok(crate::repo::EventRow {
+                    rkey: r.try_get("rkey")?,
+                    nsid: r.try_get("nsid")?,
+                    event: r.try_get("event")?,
+                    created: r.try_get("created")?,
+                })
+            })
+            .collect()
     }
 }
 

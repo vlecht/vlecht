@@ -83,6 +83,18 @@ pub async fn handler(
         .await
         .map_err(|e| XrpcError::InternalServerError(e.to_string()))?;
 
+    super::events::emit(
+        &state.db,
+        &state.events_tx,
+        super::events::NSID_REPO_DID_ASSIGN,
+        &super::events::DidAssignPayload {
+            owner_did: &actor_did,
+            repo_name: &body.name,
+            repo_did: &repo_did,
+        },
+    )
+    .await;
+
     if let Some(vis) = body.visibility.as_deref() {
         state
             .db

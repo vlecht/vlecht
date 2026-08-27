@@ -1,5 +1,6 @@
 pub mod auth;
 pub mod config;
+pub mod events;
 pub mod handlers;
 pub mod middleware;
 pub mod resolve;
@@ -27,6 +28,8 @@ pub struct AppState {
     pub pds_key_cache: tokio::sync::Mutex<std::collections::HashMap<String, PdsKeyCache>>,
     /// TTL cache for handle → DID resolutions (git transport owner paths).
     pub handle_cache: tokio::sync::Mutex<std::collections::HashMap<String, HandleCache>>,
+    /// Broadcast channel for the /events firehose notifier.
+    pub events_tx: tokio::sync::broadcast::Sender<()>,
 }
 
 /// Cached outcome of a PDS pubkey lookup.
@@ -60,7 +63,8 @@ pub fn build_app(state: Arc<AppState>) -> Router {
         .route("/{owner}/{repo}/tree", get(handlers::tree_root))
         .route("/{owner}/{repo}/blob/{*path}", get(handlers::blob))
         .route("/{owner}/{repo}/diff/{*refname}", get(handlers::diff))
-        .route("/{owner}/{repo}/archive", get(handlers::archive));
+        .route("/{owner}/{repo}/archive", get(handlers::archive))
+        .merge(events::router());
 
     // ATproto XRPC sub-router — public read endpoints at /xrpc/*.
     // Built with its own state; we mount it as a service under /xrpc so
@@ -160,6 +164,8 @@ pub fn build_state(db: Db, cfg: Arc<config::Config>) -> Arc<AppState> {
     let service_auth = vlecht_atp::service_auth::build_service_auth_config(&atp_config, &identity);
     let identity = Arc::new(identity);
 
+    let (events_tx, _) = tokio::sync::broadcast::channel(64);
+
     let lex_state = vlecht_atp::lex::LexState {
         db: db.clone(),
         version: env!("CARGO_PKG_VERSION").to_string(),
@@ -168,6 +174,7 @@ pub fn build_state(db: Db, cfg: Arc<config::Config>) -> Arc<AppState> {
             .unwrap_or_default(),
         repo_scan_path: cfg.repo_scan_path.clone(),
         audience_did: atp_config.audience_did.clone(),
+        events_tx: events_tx.clone(),
     };
 
     Arc::new(AppState {
@@ -178,5 +185,6 @@ pub fn build_state(db: Db, cfg: Arc<config::Config>) -> Arc<AppState> {
         identity,
         pds_key_cache: tokio::sync::Mutex::new(std::collections::HashMap::new()),
         handle_cache: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+        events_tx,
     })
 }

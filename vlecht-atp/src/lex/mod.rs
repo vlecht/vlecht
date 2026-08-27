@@ -23,6 +23,7 @@ pub mod delete_branch;
 pub mod delete_repo;
 pub mod describe_repo;
 pub mod diff;
+pub mod events;
 pub mod fork_status;
 pub mod fork_sync;
 pub mod get_default_branch;
@@ -66,6 +67,9 @@ pub struct LexState {
     /// The knot's own DID (did:web audience). Used as the space authority
     /// in per-repo space URIs for private repos.
     pub audience_did: String,
+    /// Broadcast channel for the /events firehose notifier. Emitted events
+    /// are durably in the `events` table; this channel only wakes readers.
+    pub events_tx: tokio::sync::broadcast::Sender<()>,
 }
 
 /// Derive a deterministic repo DID from owner DID + rkey.

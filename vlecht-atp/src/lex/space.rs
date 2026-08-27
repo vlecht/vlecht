@@ -161,6 +161,20 @@ pub async fn add_member(
         .add_repo_member(&repo_did, &body.member, Some(&actor_did), role)
         .await
         .map_err(|e| XrpcError::InternalServerError(e.to_string()))?;
+    if role == "writer" {
+        // Ready to be an autocomplete; consumption/
+        crate::lex::events::emit(
+            &state.db,
+            &state.events_tx,
+            crate::lex::events::NSID_REPO_COLLABORATOR_UPDATE,
+            &crate::lex::events::CollaboratorUpdatePayload {
+                op: "add",
+                subject: &body.member,
+                repo: &repo_did,
+            },
+        )
+        .await;
+    }
     Ok(Json(json!({ "ok": true })))
 }
 
@@ -176,6 +190,17 @@ pub async fn remove_member(
         .remove_repo_member(&repo_did, &body.member)
         .await
         .map_err(|e| XrpcError::InternalServerError(e.to_string()))?;
+    crate::lex::events::emit(
+        &state.db,
+        &state.events_tx,
+        crate::lex::events::NSID_REPO_COLLABORATOR_UPDATE,
+        &crate::lex::events::CollaboratorUpdatePayload {
+            op: "remove",
+            subject: &body.member,
+            repo: &repo_did,
+        },
+    )
+    .await;
     Ok(Json(json!({ "ok": true })))
 }
 

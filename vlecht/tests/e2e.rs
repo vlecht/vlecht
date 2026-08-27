@@ -1538,7 +1538,107 @@ async fn e2e_private_repo_git_suffix_denied() {
     }
 }
 
-/// Pushing over SSH with the full owner DID must resolve and authorize
+// ---------------------------------------------------------------------------
+// /events firehose (websocket)
+// ---------------------------------------------------------------------------
+
+/// `/events` streams `sh.tangled.repo.didAssign` on repo creation and
+/// `sh.tangled.git.refUpdate` on push, in order, on the same connection.
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_events_firehose() {
+    use futures_util::StreamExt;
+
+    let port = unique_port();
+    let _server = ServerHandle::start(port, None).await;
+
+    let url = format!("ws://127.0.0.1:{port}/events");
+    let (mut ws, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+
+    // Helper: read messages until `nsid` shows up, returning the event json
+    // for it. Bails on timeout — the assert message should say what was
+    // actually missing.
+    async fn read_until(
+        ws: &mut tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+        nsid: &str,
+    ) -> serde_json::Value {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let next = tokio::time::timeout_at(deadline, ws.next())
+                .await
+                .unwrap_or_else(|_| panic!("timed out waiting for {nsid}"))
+                .expect("ws closed")
+                .expect("ws error");
+            let tokio_tungstenite::tungstenite::Message::Text(text) = next else {
+                continue;
+            };
+            let ev: serde_json::Value = serde_json::from_str(&text).unwrap();
+            if ev["nsid"] == nsid {
+                return ev;
+            }
+        }
+    }
+
+    // Create a repo via the HTTP API — should emit didAssign over the socket.
+    let resp = reqwest::Client::new()
+        .post(format!("http://127.0.0.1:{port}/api/repos"))
+        .header("X-Vlecht-DID", "did:plc:alice")
+        .json(&serde_json::json!({"owner": "alice", "name": "eventing"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201, "repo create failed: {}", resp.text().await.unwrap_or_default());
+
+    let assign = read_until(&mut ws, "sh.tangled.repo.didAssign").await;
+    assert_eq!(assign["event"]["ownerDid"], "did:plc:alice");
+    assert_eq!(assign["event"]["repoName"], "eventing");
+    let assigned_did = assign["event"]["repoDid"]
+        .as_str()
+        .expect("repoDid in didAssign event")
+        .to_owned();
+    assert!(assigned_did.starts_with("did:plc:"));
+    assert!(assign["rkey"].is_string(), "event missing rkey: {assign}");
+    assert!(assign["created"].is_number(), "event missing created: {assign}");
+
+    // Push a commit — should emit refUpdate on the same connection.
+    let repo_did = vlecht_atp::lex::derive_repo_did("did:plc:alice", "eventing");
+    assert_eq!(repo_did, assigned_did, "didAssign repoDid must match derived DID");
+    let wd = _server.workdir("eventpush");
+    let local = wd.join("local");
+    std::fs::create_dir_all(&local).unwrap();
+    git(&local, &["init"]);
+    std::fs::write(local.join("f.txt"), "firehose\n").unwrap();
+    git(&local, &["add", "."]);
+    git(&local, &["commit", "-m", "push me"]);
+    git(
+        &local,
+        &[
+            "remote",
+            "add",
+            "origin",
+            format!("http://127.0.0.1:{port}/alice/eventing").as_str(),
+        ],
+    );
+    git_push(&local, &["push", "origin", "main"], "did:plc:alice");
+
+    let upd = read_until(&mut ws, "sh.tangled.git.refUpdate").await;
+    assert_eq!(upd["event"]["committerDid"], "did:plc:alice");
+    assert_eq!(upd["event"]["ownerDid"], "did:plc:alice");
+    assert_eq!(upd["event"]["repo"], assigned_did);
+    assert_eq!(upd["event"]["ref"], "refs/heads/main");
+    assert!(upd["event"]["newSha"].as_str().unwrap().len() == 40);
+
+    // A cursor replay sees both events again from the beginning.
+    let (mut ws2, _) = tokio_tungstenite::connect_async(format!("{url}?cursor=0"))
+        .await
+        .unwrap();
+    let replay = read_until(&mut ws2, "sh.tangled.repo.didAssign").await;
+    assert_eq!(replay["event"]["repoName"], "eventing");
+
+    ws.close(None).await.unwrap();
+    ws2.close(None).await.unwrap();
+}
 /// against the normalized DID (regression for the did:plc:did:plc: prefix).
 #[tokio::test(flavor = "multi_thread")]
 async fn ssh_git_push_full_did_owner() {

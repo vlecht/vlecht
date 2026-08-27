@@ -39,6 +39,19 @@ pub struct KnotMember {
     pub created: String,
 }
 
+/// A row in `events` — one entry of the /events websocket firehose.
+///
+/// `event` is the raw JSON payload (e.g. a `sh.tangled.repo.didAssign`
+/// or `sh.tangled.knot.memberUpdate` object). `created` is a Unix-
+/// nanosecond timestamp allocated by the high-water clock on insert.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EventRow {
+    pub rkey: String,
+    pub nsid: String,
+    pub event: String,
+    pub created: i64,
+}
+
 /// A row in `repo_members` — a member of a repo's space.
 ///
 /// `role` is `reader` (clone/fetch) or `writer` (additionally push; this
