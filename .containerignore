@@ -1,0 +1,7 @@
+target/
+.git/
+.gitignore
+AGENTS.md
+lexicons/
+*.db
+*.db-*
