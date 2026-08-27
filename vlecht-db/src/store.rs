@@ -575,10 +575,16 @@ impl RepoStore for Db {
 
         rows.iter()
             .map(|r| {
+                // Go's `events.event` was historically written as a BLOB
+                // ([]byte), so the column affinity is BLOB — decode that
+                // way and treat it as UTF-8 JSON.
+                let bytes: Vec<u8> = r.try_get("event")?;
                 Ok(crate::repo::EventRow {
                     rkey: r.try_get("rkey")?,
                     nsid: r.try_get("nsid")?,
-                    event: r.try_get("event")?,
+                    event: String::from_utf8(bytes).map_err(|e| {
+                        DbError::Sqlx(sqlx::Error::Decode(Box::new(e)))
+                    })?,
                     created: r.try_get("created")?,
                 })
             })

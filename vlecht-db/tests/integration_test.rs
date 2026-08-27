@@ -23,6 +23,57 @@ async fn open_and_migrate() {
 }
 
 #[tokio::test]
+async fn event_row_insert_roundtrip() {
+    let path = test_db_path("event_row");
+    cleanup(&path);
+
+    let db = Db::open(&path).await.unwrap();
+    db.migrate().await.unwrap();
+
+    let ev = vlecht_db::repo::EventRow {
+        rkey: "abc".into(),
+        nsid: "sh.tangled.repo.didAssign".into(),
+        event: r#"{"ownerDid":"did:plc:x"}"#.into(),
+        created: 100,
+    };
+    vlecht_db::RepoStore::insert_event(&db, &ev).await.unwrap();
+
+    let rows = vlecht_db::RepoStore::get_events(&db, 0, 10).await.unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0], ev);
+
+    cleanup(&path);
+}
+
+/// The Go-compatible `events.event` column was historically written as a
+/// BLOB ([]byte) — decoding to String must still work after migration.
+#[tokio::test]
+async fn event_row_blob_column_decodes() {
+    let path = test_db_path("event_blob");
+    cleanup(&path);
+
+    let db = Db::open(&path).await.unwrap();
+    db.migrate().await.unwrap();
+
+    // Raw insert as a BLOB the way Go's eventstream.Insert wrote it.
+    sqlx::query("INSERT INTO events (rkey, nsid, event, created) VALUES (?, ?, ?, ?)")
+        .bind("blob-row")
+        .bind("sh.tangled.git.refUpdate")
+        .bind(r#"{"committerDid":"did:plc:x","repo":"did:plc:y"}"#.as_bytes())
+        .bind(50_i64)
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+    let rows = vlecht_db::RepoStore::get_events(&db, 0, 1).await.unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].nsid, "sh.tangled.git.refUpdate");
+    assert!(rows[0].event.contains("committerDid"));
+
+    cleanup(&path);
+}
+
+#[tokio::test]
 async fn create_and_find_repo() {
     let path = test_db_path("create_find_repo");
     cleanup(&path);

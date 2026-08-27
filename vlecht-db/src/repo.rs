@@ -44,7 +44,7 @@ pub struct KnotMember {
 /// `event` is the raw JSON payload (e.g. a `sh.tangled.repo.didAssign`
 /// or `sh.tangled.knot.memberUpdate` object). `created` is a Unix-
 /// nanosecond timestamp allocated by the high-water clock on insert.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EventRow {
     pub rkey: String,
     pub nsid: String,
