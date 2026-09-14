@@ -206,52 +206,57 @@ pub async fn assert_push_auth(
     repo: &str,
     did: &str,
 ) -> Result<(), StatusCode> {
-    let expected_did = resolve_owner_did(state, owner).await;
-    let repo = normalize_repo_name(repo);
-
     // Banned accounts forfeit all repo access except the knot admin's own.
     if did != state.atp.owner_did && state.db.is_banned(did).await.unwrap_or(true) {
         tracing::warn!("auth: push denied — {did} is banned");
         return Err(StatusCode::FORBIDDEN);
     }
 
-    // Try DB alias lookup first
-    match state.db.find_repo_alias(&expected_did, repo).await {
-        Ok(alias) => {
-            if alias.owner_did == did {
-                return Ok(());
-            }
-            // Collaborators (writer-role space members) may push too.
-            let is_writer = state
-                .db
-                .get_member_role(&alias.repo_did, did)
-                .await
-                .ok()
-                .flatten()
-                .as_deref()
-                == Some("writer");
-            if is_writer {
-                return Ok(());
-            }
-            tracing::warn!(
-                "auth: push denied — {did} tried to push to {}/{} (owner is {})",
-                owner,
-                repo,
-                alias.owner_did
-            );
-            return Err(StatusCode::FORBIDDEN);
-        }
-        Err(_) => {
-            // No DB alias — ownership can't be verified, so deny.
-            tracing::warn!(
-                "auth: push denied — no DB alias for {}/{} (expected {})",
-                owner,
-                repo,
-                expected_did
-            );
-            Err(StatusCode::FORBIDDEN)
-        }
+    // Resolve the URL to `(owner_did, repo_did)`. In the single-segment form
+    // the path segment IS the repo DID, so there is no owner/rkey pair to
+    // look the alias up with.
+    let resolved = if repo.is_empty() {
+        let repo_did = normalize_repo_name(owner).to_owned();
+        state
+            .db
+            .get_repo_key_owner(&repo_did)
+            .await
+            .ok()
+            .map(|(owner_did, _)| (owner_did, repo_did))
+    } else {
+        let owner_did = resolve_owner_did(state, owner).await;
+        state
+            .db
+            .find_repo_alias(&owner_did, normalize_repo_name(repo))
+            .await
+            .ok()
+            .map(|alias| (alias.owner_did, alias.repo_did))
+    };
+
+    // No DB record — ownership can't be verified, so deny.
+    let Some((owner_did, repo_did)) = resolved else {
+        tracing::warn!("auth: push denied — no DB alias for {owner}/{repo}");
+        return Err(StatusCode::FORBIDDEN);
+    };
+    if owner_did == did {
+        return Ok(());
     }
+    // Collaborators (writer-role space members) may push too.
+    let is_writer = state
+        .db
+        .get_member_role(&repo_did, did)
+        .await
+        .ok()
+        .flatten()
+        .as_deref()
+        == Some("writer");
+    if is_writer {
+        return Ok(());
+    }
+    tracing::warn!(
+        "auth: push denied — {did} tried to push to {owner}/{repo} (owner is {owner_did})"
+    );
+    Err(StatusCode::FORBIDDEN)
 }
 
 /// Check that `did` may read `/{owner}/{repo}`.
@@ -265,13 +270,29 @@ pub async fn assert_read_auth(
     repo: &str,
     did: Option<&str>,
 ) -> Result<(), StatusCode> {
-    let owner_did = resolve_owner_did(state, owner).await;
-    let repo = normalize_repo_name(repo);
-
-    let Ok(repo_did) = state.db.get_repo_did_by_name(&owner_did, repo).await else {
-        // No DB record — untracked disk repo, treated as public.
-        return Ok(());
+    // In the single-segment form the path segment IS the repo DID.
+    let (repo_did, owner_did) = if repo.is_empty() {
+        let repo_did = normalize_repo_name(owner).to_owned();
+        let owner_did = state
+            .db
+            .get_repo_key_owner(&repo_did)
+            .await
+            .ok()
+            .map(|(owner_did, _)| owner_did);
+        (repo_did, owner_did)
+    } else {
+        let owner_did = resolve_owner_did(state, owner).await;
+        match state
+            .db
+            .get_repo_did_by_name(&owner_did, normalize_repo_name(repo))
+            .await
+        {
+            Ok(repo_did) => (repo_did, Some(owner_did)),
+            // No DB record — untracked disk repo, treated as public.
+            Err(_) => return Ok(()),
+        }
     };
+
     // Fail closed: a DB error while reading visibility is treated as
     // private (deny), never as public.
     let private = match state.db.get_repo_visibility(&repo_did).await {
@@ -287,7 +308,7 @@ pub async fn assert_read_auth(
 
     let allowed = match did {
         // The repo owner keeps read access even under a ban.
-        Some(d) if d == owner_did => true,
+        Some(d) if Some(d) == owner_did.as_deref() => true,
         // Member-derived reads are revoked while banned.
         Some(d) if d != state.atp.owner_did && state.db.is_banned(d).await.unwrap_or(true) => false,
         Some(d) => state.db.is_repo_member(&repo_did, d).await.unwrap_or(false),

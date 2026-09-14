@@ -69,8 +69,29 @@ pub async fn info_refs(
     Query(params): Query<InfoRefsParams>,
     auth: MaybeDid,
 ) -> Result<Response, StatusCode> {
-    assert_read_auth(&state, &owner, &repo, auth.0.as_deref()).await?;
-    let git_repo = open_repo(&state, &owner, &repo).await?;
+    info_refs_inner(&state, &owner, &repo, params, auth).await
+}
+
+/// Single-segment form: `/{repo_did}/info/refs` — the Go knotserver and
+/// the Tangled appview address repos by bare repo DID.
+pub async fn info_refs_did(
+    State(state): State<Arc<AppState>>,
+    Path(repo_did): Path<String>,
+    Query(params): Query<InfoRefsParams>,
+    auth: MaybeDid,
+) -> Result<Response, StatusCode> {
+    info_refs_inner(&state, &repo_did, "", params, auth).await
+}
+
+async fn info_refs_inner(
+    state: &AppState,
+    owner: &str,
+    repo: &str,
+    params: InfoRefsParams,
+    auth: MaybeDid,
+) -> Result<Response, StatusCode> {
+    assert_read_auth(state, owner, repo, auth.0.as_deref()).await?;
+    let git_repo = open_repo(state, owner, repo).await?;
 
     match params.service.as_deref() {
         Some("git-upload-pack") => {
@@ -118,8 +139,30 @@ pub async fn upload_pack(
     headers: http::HeaderMap,
     body: axum::body::Bytes,
 ) -> Result<Response, StatusCode> {
-    assert_read_auth(&state, &owner, &repo, auth.0.as_deref()).await?;
-    let git_repo = open_repo(&state, &owner, &repo).await?;
+    upload_pack_inner(&state, &owner, &repo, auth, headers, body).await
+}
+
+/// Single-segment form: `POST /{repo_did}/git-upload-pack`.
+pub async fn upload_pack_did(
+    State(state): State<Arc<AppState>>,
+    Path(repo_did): Path<String>,
+    auth: MaybeDid,
+    headers: http::HeaderMap,
+    body: axum::body::Bytes,
+) -> Result<Response, StatusCode> {
+    upload_pack_inner(&state, &repo_did, "", auth, headers, body).await
+}
+
+async fn upload_pack_inner(
+    state: &AppState,
+    owner: &str,
+    repo: &str,
+    auth: MaybeDid,
+    headers: http::HeaderMap,
+    body: axum::body::Bytes,
+) -> Result<Response, StatusCode> {
+    assert_read_auth(state, owner, repo, auth.0.as_deref()).await?;
+    let git_repo = open_repo(state, owner, repo).await?;
     let decompressed = maybe_decompress(&headers, &body);
 
     let data = git_repo
@@ -338,12 +381,34 @@ pub async fn receive_pack(
     headers: http::HeaderMap,
     body: axum::body::Bytes,
 ) -> Result<Response, StatusCode> {
-    assert_push_auth(&state, &owner, &repo, &did.0).await?;
+    receive_pack_inner(&state, &owner, &repo, did, headers, body).await
+}
+
+/// Single-segment form: `POST /{repo_did}/git-receive-pack`.
+pub async fn receive_pack_did(
+    State(state): State<Arc<AppState>>,
+    Path(repo_did): Path<String>,
+    Extension(did): Extension<Did>,
+    headers: http::HeaderMap,
+    body: axum::body::Bytes,
+) -> Result<Response, StatusCode> {
+    receive_pack_inner(&state, &repo_did, "", did, headers, body).await
+}
+
+async fn receive_pack_inner(
+    state: &Arc<AppState>,
+    owner: &str,
+    repo: &str,
+    did: Did,
+    headers: http::HeaderMap,
+    body: axum::body::Bytes,
+) -> Result<Response, StatusCode> {
+    assert_push_auth(state, owner, repo, &did.0).await?;
 
     let (data, changes) = {
         // Keep the gix handle scoped: it isn't Send and must not cross
         // the emit await below.
-        let git_repo = open_repo(&state, &owner, &repo).await?;
+        let git_repo = open_repo(state, owner, repo).await?;
         let decompressed = maybe_decompress(&headers, &body);
         git_repo
             .receive_pack(&decompressed)
@@ -351,7 +416,7 @@ pub async fn receive_pack(
     };
 
     if !changes.is_empty() {
-        crate::events::emit_ref_updates(&state, &did.0, &owner, &repo, &changes).await;
+        crate::events::emit_ref_updates(state, &did.0, owner, repo, &changes).await;
     }
 
     Ok(Response::builder()

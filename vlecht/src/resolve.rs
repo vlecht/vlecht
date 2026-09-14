@@ -6,7 +6,7 @@
 //! 3. `<scan_path>/<owner>/<repo>` — legacy short owner name
 
 use crate::AppState;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use vlecht_db::RepoStore;
 use vlecht_git::paths::{is_safe_segment, join_safe, resolve_within_root};
 
@@ -15,17 +15,17 @@ pub(crate) async fn resolve_repo_path(
     owner: &str,
     repo: &str,
 ) -> Option<PathBuf> {
+    // Single-segment form: `owner` is the repo DID itself (Tangled clients
+    // and the appview emit `<knot>/<repo-did>` when the owner/rkey pair is
+    // unknown). Mirrors Go's `ResolveRepoDIDOnDisk`.
+    if repo.is_empty() {
+        return resolve_repo_did_dir(&state.cfg.repo_scan_path, owner);
+    }
+
     if !is_safe_segment(owner) || !is_safe_segment(repo) {
         return None;
     }
     let root = &state.cfg.repo_scan_path;
-
-    // Single-segment form: `owner` is the repo DID itself (Tangled clients
-    // emit `ssh://git@knot/<repo-did>.git` when the rkey is unknown).
-    if repo.is_empty() {
-        let canon = resolve_within_root(root, &root.join(owner))?;
-        return canon.join("HEAD").exists().then_some(canon);
-    }
 
     // Tangled clients and git itself commonly address repos with a `.git`
     // suffix; the DB alias and on-disk dir never carry it.
@@ -54,4 +54,15 @@ pub(crate) async fn resolve_repo_path(
         }
     }
     None
+}
+
+/// Canonical Go-parity layout: the bare repo IS the `<scan_path>/<repo_did>`
+/// directory. Accepts an optional `.git` suffix (old clones emit it).
+fn resolve_repo_did_dir(root: &Path, repo_did: &str) -> Option<PathBuf> {
+    let repo_did = repo_did.strip_suffix(".git").unwrap_or(repo_did);
+    if !is_safe_segment(repo_did) {
+        return None;
+    }
+    let canon = resolve_within_root(root, &root.join(repo_did))?;
+    canon.join("HEAD").exists().then_some(canon)
 }

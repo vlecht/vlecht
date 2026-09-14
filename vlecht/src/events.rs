@@ -30,25 +30,29 @@ pub async fn emit_ref_updates(
     repo: &str,
     changes: &[vlecht_git::RefChange],
 ) {
-    {
+    // Resolve the URL shape to `(owner_did, repo_did)`. In the single-segment
+    // form the path segment is the repo DID itself.
+    let (owner_did, repo_did) = if repo.is_empty() {
+        let repo_did = crate::auth::normalize_repo_name(owner).to_owned();
+        match state.db.get_repo_key_owner(&repo_did).await {
+            Ok((owner_did, _)) => (owner_did, repo_did),
+            Err(_) => {
+                tracing::debug!("events: no owner for {repo_did}, skipping refUpdate");
+                return;
+            }
+        }
+    } else {
         let owner_did = crate::auth::resolve_owner_did(state, owner).await;
         let repo = crate::auth::normalize_repo_name(repo);
-        let repo_did = state
-            .db
-            .get_repo_did_by_name(&owner_did, repo)
-            .await
-            .unwrap_or_else(|_| String::new());
-        if repo_did.is_empty() {
-            tracing::debug!("events: no repo DID for {owner_did}/{repo}, skipping refUpdate");
-            return;
+        match state.db.get_repo_did_by_name(&owner_did, repo).await {
+            Ok(repo_did) => (owner_did, repo_did),
+            Err(_) => {
+                tracing::debug!("events: no repo DID for {owner_did}/{repo}, skipping refUpdate");
+                return;
+            }
         }
-    }
-
-    let owner_did = crate::auth::resolve_owner_did(state, owner).await;
-    let repo = crate::auth::normalize_repo_name(repo);
-    let Ok(repo_did) = state.db.get_repo_did_by_name(&owner_did, repo).await else {
-        return;
     };
+
     for c in changes {
         vlecht_atp::lex::events::emit(
             &state.db,

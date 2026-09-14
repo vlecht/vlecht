@@ -51,6 +51,13 @@ pub fn build_app(state: Arc<AppState>) -> Router {
     // Public read routes — no auth required
     let public = Router::new()
         .route("/", get(handlers::healthcheck))
+        // Single-segment form (`/<repo-did>`) — the legacy Go knotserver and
+        // Tangled appview shape, where the repo DID is the whole path.
+        .route("/{repo_did}/info/refs", get(handlers::info_refs_did))
+        .route(
+            "/{repo_did}/git-upload-pack",
+            post(handlers::upload_pack_did),
+        )
         .route("/{owner}/{repo}/info/refs", get(handlers::info_refs))
         .route(
             "/{owner}/{repo}/git-upload-pack",
@@ -78,6 +85,10 @@ pub fn build_app(state: Arc<AppState>) -> Router {
     // Raise the body limit for git push (pack data can be large).
     // axum's default Bytes extractor caps at 2 MB, which rejects real pushes.
     let receive = Router::new()
+        .route(
+            "/{repo_did}/git-receive-pack",
+            post(handlers::receive_pack_did),
+        )
         .route(
             "/{owner}/{repo}/git-receive-pack",
             post(handlers::receive_pack),

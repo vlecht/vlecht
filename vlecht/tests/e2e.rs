@@ -133,6 +133,11 @@ impl ServerHandle {
         )
     }
 
+    /// Single-segment repo-DID URL (Go knotserver / Tangled appview shape).
+    fn http_did_url(&self, repo_did: &str) -> String {
+        format!("http://127.0.0.1:{}/{}", self.http_port, repo_did)
+    }
+
     fn ssh_url(&self, owner: &str, repo: &str) -> String {
         format!(
             "ssh://git@127.0.0.1:{}/{}",
@@ -1536,6 +1541,91 @@ async fn e2e_private_repo_git_suffix_denied() {
             "{stderr}"
         );
     }
+}
+
+/// The Tangled appview and the Go knotserver address repos by bare repo DID
+/// (`/<repo-did>/info/refs?service=git-upload-pack`), with no owner/rkey
+/// segment. Anonymous fetch/clone of a public repo in the DID-dir layout must
+/// work — this is the URL shape that 404'd in production.
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_http_single_did_anonymous_fetch() {
+    let port = unique_port();
+    let server = ServerHandle::start(port, None).await;
+    let repo_path = seed_did_dir_repo(&server, "alice", "singledid").await;
+
+    let wd = server.workdir("single_did_fetch_work");
+    let src = wd.join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    git(&src, &["init"]);
+    std::fs::write(src.join("f.txt"), "single-did\n").unwrap();
+    git(&src, &["add", "."]);
+    git(&src, &["commit", "-m", "init"]);
+    git(&src, &["remote", "add", "origin", repo_path.to_str().unwrap()]);
+    git(&src, &["push", "origin", "main"]);
+
+    let repo_did = vlecht_atp::lex::derive_repo_did("did:plc:alice", "singledid");
+    // Anonymous (no auth header): both the plain and `.git`-suffixed forms.
+    let base = server.http_did_url(&repo_did);
+    for url in [base.clone(), format!("{base}.git")] {
+        let out = git_output(&wd, &["ls-remote", &url]);
+        assert!(out.contains("refs/heads/main"), "ls-remote {url}: {out}");
+    }
+
+    // Anonymous clone of the bare-DID URL.
+    let clone_wd = server.workdir("single_did_clone_work");
+    git_output(&clone_wd, &["clone", &base, "dst"]);
+    assert_eq!(
+        std::fs::read_to_string(clone_wd.join("dst").join("f.txt")).unwrap(),
+        "single-did\n"
+    );
+}
+
+/// A private repo addressed by bare repo DID must fail closed for anonymous
+/// callers (404 — existence must not leak), while the owner and space members
+/// keep read access through the same single-DID shape.
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_http_single_did_private_denied() {
+    let port = unique_port();
+    let server = ServerHandle::start(port, None).await;
+    let repo_path = seed_did_dir_repo(&server, "alice", "singlepriv").await;
+
+    let repo_did = vlecht_atp::lex::derive_repo_did("did:plc:alice", "singlepriv");
+    server
+        .db
+        .set_repo_visibility(&repo_did, "private")
+        .await
+        .unwrap();
+    server.db.add_did("did:plc:bob").await.unwrap();
+    server
+        .db
+        .add_repo_member(&repo_did, "did:plc:bob", Some("did:plc:alice"), "reader")
+        .await
+        .unwrap();
+
+    let wd = server.workdir("single_priv_work");
+    let src = wd.join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    git(&src, &["init"]);
+    std::fs::write(src.join("f.txt"), "single-priv\n").unwrap();
+    git(&src, &["add", "."]);
+    git(&src, &["commit", "-m", "init"]);
+    git(&src, &["remote", "add", "origin", repo_path.to_str().unwrap()]);
+    git(&src, &["push", "origin", "main"]);
+
+    let base = server.http_did_url(&repo_did);
+    for url in [base.clone(), format!("{base}.git")] {
+        let stderr = git_fail(&wd, &["ls-remote", &url], None);
+        assert!(
+            stderr.contains("not found") || stderr.contains("404"),
+            "anonymous {url}: {stderr}"
+        );
+    }
+
+    // Owner and member keep read access through the single-DID shape.
+    let owner_wd = server.workdir("single_priv_owner_work");
+    git_push(&owner_wd, &["ls-remote", &base], "did:plc:alice");
+    let member_wd = server.workdir("single_priv_member_work");
+    git_push(&member_wd, &["ls-remote", &base], "did:plc:bob");
 }
 
 // ---------------------------------------------------------------------------
