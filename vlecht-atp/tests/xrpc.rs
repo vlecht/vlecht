@@ -320,6 +320,123 @@ async fn xrpc_list_keys_returns_populated_and_paginates() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn xrpc_list_members_returns_empty_array() {
+    let server = ServerHandle::start().await;
+    // The exact request the tangled.org AppView makes.
+    let (status, body) = fetch_json(
+        &server,
+        "/xrpc/sh.tangled.knot.listMembers?subject=knot.clee.sh&limit=1000",
+    )
+    .await;
+    assert_eq!(status, 200, "expected 200, got {status}, body={body}");
+    assert!(body["items"].is_array(), "body={body}");
+    assert_eq!(body["items"].as_array().unwrap().len(), 0);
+    // No `cursor` when the result is empty.
+    assert!(body.get("cursor").is_none() || body["cursor"].is_null());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn xrpc_list_members_is_public_without_auth() {
+    // Regression guard: the AppView polls this endpoint anonymously. The
+    // whole bug was a 401. Run against the service-auth-configured router
+    // (AuthServer), where the bug actually manifests.
+    let server = AuthServer::start().await;
+    let resp = reqwest::get(server.url("/xrpc/sh.tangled.knot.listMembers"))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status().as_u16(),
+        200,
+        "listMembers must be public (no auth)"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn xrpc_list_members_dedupes_and_paginates() {
+    use vlecht_db::RepoStore;
+    let server = ServerHandle::start().await;
+    let db = server.db().await;
+    // sub1 appears twice; the lowest id wins and `addedBy` is that row's did.
+    db.add_knot_member("did:plc:a", "r0", "did:plc:sub1")
+        .await
+        .unwrap();
+    db.add_knot_member("did:plc:b", "r0", "did:plc:sub1")
+        .await
+        .unwrap();
+    db.add_knot_member("did:plc:c", "r0", "did:plc:sub2")
+        .await
+        .unwrap();
+    db.add_knot_member("did:plc:d", "r0", "did:plc:sub3")
+        .await
+        .unwrap();
+    db.add_knot_member("did:plc:e", "r0", "did:plc:sub4")
+        .await
+        .unwrap();
+
+    // limit=2: first two distinct subjects, ascending id.
+    let (status, body) = fetch_json(&server, "/xrpc/sh.tangled.knot.listMembers?limit=2").await;
+    assert_eq!(status, 200, "body={body}");
+    let items = body["items"].as_array().unwrap();
+    assert_eq!(items.len(), 2);
+    assert_eq!(items[0]["subject"], "did:plc:sub1");
+    // Dedupe: sub1's row is the first insert (did:plc:a), not the second.
+    assert_eq!(items[0]["addedBy"], "did:plc:a");
+    assert_eq!(items[1]["subject"], "did:plc:sub2");
+    for it in items {
+        assert!(it["subject"].is_string());
+        assert!(it["addedBy"].is_string());
+        assert!(it["createdAt"].is_string());
+    }
+    let cursor = body["cursor"].as_str().unwrap();
+
+    // Next page: the remaining two distinct subjects.
+    let (status2, body2) = fetch_json(
+        &server,
+        &format!("/xrpc/sh.tangled.knot.listMembers?limit=2&cursor={cursor}"),
+    )
+    .await;
+    assert_eq!(status2, 200, "body={body2}");
+    let items2 = body2["items"].as_array().unwrap();
+    assert_eq!(items2.len(), 2);
+    assert_eq!(items2[0]["subject"], "did:plc:sub3");
+    assert_eq!(items2[1]["subject"], "did:plc:sub4");
+
+    // Past the end: empty.
+    let cursor2 = body2["cursor"].as_str().unwrap();
+    let (status3, body3) = fetch_json(
+        &server,
+        &format!("/xrpc/sh.tangled.knot.listMembers?limit=2&cursor={cursor2}"),
+    )
+    .await;
+    assert_eq!(status3, 200);
+    assert_eq!(body3["items"].as_array().unwrap().len(), 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn xrpc_unknown_route_returns_404_not_401() {
+    // With service auth configured (the production shape), an unmatched
+    // /xrpc path previously hit the write router's auth-wrapped fallback
+    // and returned 401. It must be a 404 XRPC error envelope.
+    let server = AuthServer::start().await;
+    let resp = reqwest::get(server.url("/xrpc/sh.tangled.bogus.nope"))
+        .await
+        .unwrap();
+    let status = resp.status().as_u16();
+    let body: serde_json::Value = resp.json().await.unwrap_or_default();
+    assert_eq!(status, 404, "expected 404, got {status}, body={body}");
+    assert_eq!(body["error"], "NotFound");
+
+    // Unauthenticated writes to a real endpoint must still be 401.
+    let resp = reqwest::Client::new()
+        .post(server.url("/xrpc/sh.tangled.repo.create"))
+        .json(&serde_json::json!({ "name": "x", "repoDid": "did:plc:x" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 401);
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn xrpc_describe_repo_with_owner_repo_form() {
     let server = ServerHandle::start().await;
     let _commit_sha = seed_repo(&server, "alice", "foo").await;

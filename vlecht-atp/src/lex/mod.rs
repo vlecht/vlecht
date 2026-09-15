@@ -28,6 +28,7 @@ pub mod fork_status;
 pub mod fork_sync;
 pub mod get_default_branch;
 pub mod hidden_ref;
+pub mod knot_members;
 pub mod languages;
 pub mod list_keys;
 pub mod log;
@@ -43,6 +44,7 @@ pub mod tags;
 pub mod tree;
 pub mod version;
 
+use crate::error::XrpcError;
 use axum::middleware;
 use axum::middleware::Next;
 use axum::response::Response;
@@ -108,6 +110,7 @@ where
         // knot.*
         .route("/sh.tangled.knot.version", get(version::handler))
         .route("/sh.tangled.knot.listKeys", get(list_keys::handler))
+        .route("/sh.tangled.knot.listMembers", get(knot_members::handler))
         // repo.*
         .route("/sh.tangled.owner", get(owner::handler))
         .route("/sh.tangled.repo.describeRepo", get(describe_repo::handler))
@@ -194,7 +197,17 @@ where
         ));
     }
 
-    public.merge(write)
+    // Unknown `/xrpc/*` paths must return a 404 XRPC envelope, not 401.
+    // `Router::merge` adopts the write router's fallback, which `.layer`
+    // wrapped in `service_auth_middleware` — so without this explicit
+    // fallback an unmatched path looks like an auth failure.
+    public.merge(write).fallback(not_found)
+}
+
+/// Fallback handler for unknown XRPC methods: 404 with the standard
+/// `{"error": "NotFound", "message": ...}` envelope.
+async fn not_found() -> XrpcError {
+    XrpcError::NotFound("unknown xrpc method".to_string())
 }
 
 /// Service-auth middleware variant that only engages when an

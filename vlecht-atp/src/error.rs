@@ -33,6 +33,8 @@ pub enum XrpcError {
     InternalServerError(String),
     #[error("OwnerNotFound")]
     OwnerNotFound,
+    #[error("NotFound: {0}")]
+    NotFound(String),
     #[error("MissingActorDid")]
     MissingActorDid,
     #[error("Unauthorized")]
@@ -54,6 +56,7 @@ impl XrpcError {
             Self::RecordExists(_) => "RecordExists",
             Self::InternalServerError(_) => "InternalServerError",
             Self::OwnerNotFound => "OwnerNotFound",
+            Self::NotFound(_) => "NotFound",
             Self::MissingActorDid => "MissingActorDid",
             Self::Unauthorized => "Unauthorized",
         }
@@ -103,7 +106,8 @@ impl IntoResponse for XrpcError {
             | Self::TagNotFound(_)
             | Self::PathNotFound(_)
             | Self::RefNotFound(_)
-            | Self::FileNotFound(_) => (
+            | Self::FileNotFound(_)
+            | Self::NotFound(_) => (
                 StatusCode::NOT_FOUND,
                 json!({
                     "error": self.tag(),

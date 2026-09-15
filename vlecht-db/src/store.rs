@@ -1,5 +1,5 @@
 use crate::error::DbError;
-use crate::repo::{PublicKey, RepoAlias};
+use crate::repo::{KnotMember, PublicKey, RepoAlias};
 use crate::Db;
 use sqlx::Row;
 
@@ -99,6 +99,22 @@ pub trait RepoStore {
 
     /// List all banned DIDs.
     async fn list_banned(&self) -> Result<Vec<String>, DbError>;
+
+    // --- knot_members ---
+
+    /// Seed a knot member row (`did` added `subject`). Used by tests and the
+    /// Go-DB import path; matches Go `AddKnotMemberDirect`.
+    async fn add_knot_member(&self, did: &str, rkey: &str, subject: &str) -> Result<(), DbError>;
+
+    /// Paginated list of distinct knot members, ordered by id ascending.
+    /// Only the lowest `id` per `subject` is returned (dedupe, matching Go's
+    /// `ListKnotMembers`). Returns up to `limit` rows whose `id` is strictly
+    /// greater than `cursor`; `cursor == ""` starts at the beginning.
+    async fn list_knot_members_paginated(
+        &self,
+        limit: i64,
+        cursor: &str,
+    ) -> Result<Vec<KnotMember>, DbError>;
 
     // --- public_keys ---
 
@@ -461,6 +477,36 @@ impl RepoStore for Db {
             .collect()
     }
 
+    async fn add_knot_member(&self, did: &str, rkey: &str, subject: &str) -> Result<(), DbError> {
+        sqlx::query("INSERT OR IGNORE INTO knot_members (did, rkey, subject) VALUES (?, ?, ?)")
+            .bind(did)
+            .bind(rkey)
+            .bind(subject)
+            .execute(self.pool())
+            .await?;
+        Ok(())
+    }
+
+    async fn list_knot_members_paginated(
+        &self,
+        limit: i64,
+        cursor: &str,
+    ) -> Result<Vec<KnotMember>, DbError> {
+        // cursor is the row id; rows with id > cursor come next.
+        let cursor_id: i64 = cursor.parse().unwrap_or(0);
+        let rows = sqlx::query(
+            "SELECT id, did, rkey, subject, created FROM knot_members \
+             WHERE id IN (SELECT min(id) FROM knot_members GROUP BY subject) AND id > ? \
+             ORDER BY id ASC LIMIT ?",
+        )
+        .bind(cursor_id)
+        .bind(limit)
+        .fetch_all(self.pool())
+        .await?;
+
+        rows.iter().map(row_to_knot_member).collect()
+    }
+
     async fn is_repo_member(&self, repo_did: &str, member_did: &str) -> Result<bool, DbError> {
         let row = sqlx::query(
             "SELECT count(1) as cnt FROM repo_members WHERE repo_did = ? AND member_did = ?",
@@ -597,6 +643,16 @@ fn row_to_public_key(r: &sqlx::sqlite::SqliteRow) -> Result<PublicKey, DbError> 
         id: r.try_get("id")?,
         did: r.try_get("did")?,
         key: r.try_get("key")?,
+        created: r.try_get("created")?,
+    })
+}
+
+fn row_to_knot_member(r: &sqlx::sqlite::SqliteRow) -> Result<KnotMember, DbError> {
+    Ok(KnotMember {
+        id: r.try_get("id")?,
+        did: r.try_get("did")?,
+        rkey: r.try_get("rkey")?,
+        subject: r.try_get("subject")?,
         created: r.try_get("created")?,
     })
 }
