@@ -126,11 +126,7 @@ impl ServerHandle {
     }
 
     fn http_url(&self, owner: &str, repo: &str) -> String {
-        format!(
-            "http://127.0.0.1:{}/{}",
-            self.http_port,
-            format!("{}/{}", owner, repo)
-        )
+        format!("http://127.0.0.1:{}/{owner}/{repo}", self.http_port)
     }
 
     /// Single-segment repo-DID URL (Go knotserver / Tangled appview shape).
@@ -139,11 +135,7 @@ impl ServerHandle {
     }
 
     fn ssh_url(&self, owner: &str, repo: &str) -> String {
-        format!(
-            "ssh://git@127.0.0.1:{}/{}",
-            self.ssh_port,
-            format!("{}/{}", owner, repo)
-        )
+        format!("ssh://git@127.0.0.1:{}/{owner}/{repo}", self.ssh_port)
     }
 
     /// GIT_SSH_COMMAND value that uses the test key and accepts any host key.
@@ -221,7 +213,7 @@ fn git(repo: &Path, args: &[&str]) {
     let mut cmd = vec!["-c", "init.defaultBranch=main"];
     cmd.extend(git_global_config());
     cmd.extend(args);
-    let full_args: Vec<&str> = cmd.iter().copied().collect();
+    let full_args: Vec<&str> = cmd.to_vec();
     let out = Command::new("git")
         .args(&full_args)
         .current_dir(repo)
@@ -248,7 +240,7 @@ fn git_push(repo: &Path, args: &[&str], did: &str) {
     cmd.push("-c");
     cmd.push(&extra);
     cmd.extend(args);
-    let full_args: Vec<&str> = cmd.iter().copied().collect();
+    let full_args: Vec<&str> = cmd.to_vec();
     let out = Command::new("git")
         .args(&full_args)
         .current_dir(repo)
@@ -811,7 +803,7 @@ fn git_ssh(repo: &Path, args: &[&str], ssh_cmd: &str) {
     cmd.extend(git_global_config());
     cmd.extend(git_ssh_config());
     cmd.extend(args);
-    let full_args: Vec<&str> = cmd.iter().copied().collect();
+    let full_args: Vec<&str> = cmd.to_vec();
     let out = Command::new("git")
         .args(&full_args)
         .current_dir(repo)

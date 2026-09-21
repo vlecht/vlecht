@@ -16,7 +16,7 @@ pub enum GitError {
 
 impl From<flate2::CompressError> for GitError {
     fn from(e: flate2::CompressError) -> Self {
-        GitError::Io(std::io::Error::new(std::io::ErrorKind::Other, e))
+        GitError::Io(std::io::Error::other(e))
     }
 }
 

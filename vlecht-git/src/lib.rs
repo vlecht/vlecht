@@ -64,6 +64,13 @@ pub struct SubmoduleInfo {
     pub url: String,
 }
 
+/// A mutable visitor invoked per blob with `(path, contents)`.
+type BlobVisitor<'a> = &'a mut dyn FnMut(&str, &[u8]) -> Result<(), GitError>;
+
+/// Per-language `(name, total bytes, percent of repo)` stats, plus
+/// repo-wide total bytes and file count.
+pub type LanguageStats = (Vec<(String, u64, f64)>, u64, u64);
+
 // ---------------------------------------------------------------------------
 // Repo handle
 // ---------------------------------------------------------------------------
@@ -266,10 +273,7 @@ impl GitRepo {
 
     /// Collect language statistics (name, size, percentage) by walking the tree
     /// and classifying files by extension.
-    pub fn language_stats(
-        &self,
-        ref_name: &str,
-    ) -> Result<(Vec<(String, u64, f64)>, u64, u64), GitError> {
+    pub fn language_stats(&self, ref_name: &str) -> Result<LanguageStats, GitError> {
         let spec = self.inner.rev_parse_single(ref_name)?;
         let commit = spec.object()?.try_into_commit()?;
         let tree = commit.tree()?;
@@ -279,7 +283,7 @@ impl GitRepo {
         let mut total_size: u64 = 0;
         let mut total_files: u64 = 0;
 
-        walk_tree(&self.inner, &tree, "", &mut |_path, data| {
+        walk_tree(&tree, "", &mut |_path, data| {
             total_files += 1;
             total_size += data.len() as u64;
             if let Some(lang) = detect_language(_path) {
@@ -299,7 +303,7 @@ impl GitRepo {
                 (name, size, pct)
             })
             .collect();
-        stats.sort_by(|a, b| b.1.cmp(&a.1));
+        stats.sort_by_key(|(_, size, _)| std::cmp::Reverse(*size));
 
         Ok((stats, total_size, total_files))
     }
@@ -383,7 +387,7 @@ impl GitRepo {
                         if let Ok(old_entry) = pt.lookup_entry(components.clone()) {
                             let current_tree_id = tree.id();
                             let old_matches =
-                                old_entry.map_or(true, |oe| oe.oid() == current_tree_id.detach());
+                                old_entry.is_none_or(|oe| oe.oid() == current_tree_id.detach());
                             if !old_matches {
                                 changed = true;
                                 break;
@@ -486,7 +490,7 @@ impl GitRepo {
         let tree = commit.tree()?;
 
         // Pre-flight: estimate total content size to prevent OOM on large repos.
-        let estimated = estimate_tree_size(&self.inner, &tree);
+        let estimated = estimate_tree_size(&tree);
         if estimated > MAX_ARCHIVE_BYTES {
             return Err(GitError::Protocol(format!(
                 "archive too large: estimated {} bytes (max {})",
@@ -499,13 +503,13 @@ impl GitRepo {
             ArchiveFormat::TarGz => {
                 let gz = GzEncoder::new(&mut buf, Compression::default());
                 let mut tar = tar::Builder::new(gz);
-                write_tree_to_tar(&self.inner, &tree, prefix, &mut tar)?;
+                write_tree_to_tar(&tree, prefix, &mut tar)?;
                 let gz = tar.into_inner()?;
                 gz.finish()?;
             }
             ArchiveFormat::Zip => {
                 let mut zip = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
-                write_tree_to_zip(&self.inner, &tree, prefix, &mut zip)?;
+                write_tree_to_zip(&tree, prefix, &mut zip)?;
                 zip.finish()?;
             }
         }
@@ -808,7 +812,7 @@ impl GitRepo {
             let new_oid = new_oid.unwrap();
 
             // Verify new object exists in our DB
-            if !self.inner.find_object(new_oid).is_ok() {
+            if self.inner.find_object(new_oid).is_err() {
                 reports.push(format!("ng {} no-such-object\n", cmd.refname));
                 continue;
             }
@@ -855,7 +859,7 @@ impl GitRepo {
         // We do the Bundle write first (handles thin-pack delta resolution
         // fully), then re-parse to extract individual objects.
         let pack_dir = self.inner.git_dir().join("objects").join("pack");
-        std::fs::create_dir_all(&pack_dir).map_err(|e| GitError::Io(e))?;
+        std::fs::create_dir_all(&pack_dir).map_err(GitError::Io)?;
 
         // Parse with Bundle::write_to_directory which handles all delta resolution
         let mut reader = std::io::BufReader::new(pack_data);
@@ -1054,11 +1058,10 @@ impl GitRepo {
     /// Check if `ancestor` is an ancestor of `descendant` (i.e., descendant
     /// contains ancestor in its history).
     pub fn is_ancestor(&self, ancestor: &str, descendant: &str) -> Result<bool, GitError> {
-        let base = self.merge_base(ancestor, descendant)?;
-        match base {
-            Some(ref base_oid) => {
-                let anc = self.inner.rev_parse_single(ancestor)?;
-                Ok(anc.detach().to_string() == *base_oid)
+        match self.merge_base(ancestor, descendant)? {
+            Some(base) => {
+                let anc = self.inner.rev_parse_single(ancestor)?.detach();
+                Ok(gix::ObjectId::from_hex(base.as_bytes()).is_ok_and(|oid| oid == anc))
             }
             None => Ok(false),
         }
@@ -1535,7 +1538,7 @@ fn iso8601(time: &gix::date::Time) -> String {
     let abs = offset.unsigned_abs();
     let h = abs / 3600;
     let m = (abs % 3600) / 60;
-    let dt = chrono::DateTime::from_timestamp(time.seconds.into(), 0).unwrap_or_default();
+    let dt = chrono::DateTime::from_timestamp(time.seconds, 0).unwrap_or_default();
     format!(
         "{} {}{:02}:{:02}",
         dt.format("%Y-%m-%dT%H:%M:%S"),
@@ -1612,13 +1615,13 @@ fn detect_language(path: &str) -> Option<&'static str> {
 
 /// Estimate the total uncompressed size of all blobs in a tree (recursively).
 /// Used as a pre-flight check to reject archives that would OOM the server.
-fn estimate_tree_size(repo: &gix::Repository, tree: &gix::Tree<'_>) -> usize {
+fn estimate_tree_size(tree: &gix::Tree<'_>) -> usize {
     let mut total = 0;
-    estimate_tree_size_inner(repo, tree, &mut total);
+    estimate_tree_size_inner(tree, &mut total);
     total
 }
 
-fn estimate_tree_size_inner(repo: &gix::Repository, tree: &gix::Tree<'_>, total: &mut usize) {
+fn estimate_tree_size_inner(tree: &gix::Tree<'_>, total: &mut usize) {
     // Bail out early if we've already exceeded the cap — no point walking further.
     if *total > MAX_ARCHIVE_BYTES {
         return;
@@ -1638,7 +1641,7 @@ fn estimate_tree_size_inner(repo: &gix::Repository, tree: &gix::Tree<'_>, total:
             EntryKind::Tree => {
                 if let Ok(obj) = entry.object() {
                     if let Ok(sub) = obj.try_into_tree() {
-                        estimate_tree_size_inner(repo, &sub, total);
+                        estimate_tree_size_inner(&sub, total);
                     }
                 }
             }
@@ -1649,12 +1652,7 @@ fn estimate_tree_size_inner(repo: &gix::Repository, tree: &gix::Tree<'_>, total:
 
 /// Walk a git tree and call `emit` for each blob with `(path, data)`.
 /// Directories are recursed into automatically; `prefix` gets a trailing `/` appended.
-fn walk_tree(
-    repo: &gix::Repository,
-    tree: &gix::Tree<'_>,
-    prefix: &str,
-    sink: &mut dyn FnMut(&str, &[u8]) -> Result<(), GitError>,
-) -> Result<(), GitError> {
+fn walk_tree(tree: &gix::Tree<'_>, prefix: &str, sink: BlobVisitor<'_>) -> Result<(), GitError> {
     for entry in tree.iter() {
         let entry = entry?;
         let name = entry.filename().to_str_lossy().into_owned();
@@ -1667,7 +1665,7 @@ fn walk_tree(
             }
             EntryKind::Tree => {
                 let sub = entry.object()?.try_into_tree()?;
-                walk_tree(repo, &sub, &format!("{path}/"), sink)?;
+                walk_tree(&sub, &format!("{path}/"), sink)?;
             }
             _ => {}
         }
@@ -1676,7 +1674,6 @@ fn walk_tree(
 }
 
 fn write_tree_to_tar<W: Write>(
-    repo: &gix::Repository,
     tree: &gix::Tree<'_>,
     prefix: &str,
     tar: &mut tar::Builder<W>,
@@ -1684,7 +1681,7 @@ fn write_tree_to_tar<W: Write>(
     let mut dir_header = tar::Header::new_gnu();
     tar.append_data(&mut dir_header, prefix, &[] as &[u8])?;
 
-    walk_tree(repo, tree, prefix, &mut |path, data| {
+    walk_tree(tree, prefix, &mut |path, data| {
         let mut header = tar::Header::new_gnu();
         header.set_size(data.len() as u64);
         header.set_mode(0o100644);
@@ -1694,7 +1691,6 @@ fn write_tree_to_tar<W: Write>(
 }
 
 fn write_tree_to_zip<W: Write + std::io::Seek>(
-    repo: &gix::Repository,
     tree: &gix::Tree<'_>,
     prefix: &str,
     zip: &mut zip::ZipWriter<W>,
@@ -1703,7 +1699,7 @@ fn write_tree_to_zip<W: Write + std::io::Seek>(
     let opts = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
     zip.add_directory(prefix, opts)?;
 
-    walk_tree(repo, tree, prefix, &mut |path, data| {
+    walk_tree(tree, prefix, &mut |path, data| {
         zip.start_file(path, opts)?;
         zip.write_all(data)?;
         Ok(())

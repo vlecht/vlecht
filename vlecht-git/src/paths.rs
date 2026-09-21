@@ -38,7 +38,7 @@ pub fn resolve_within_root(root: &Path, candidate: &Path) -> Option<PathBuf> {
     // Canonicalize both so a symlink under root can't point outside it.
     let root_canon = root.canonicalize().ok()?;
     let canon = candidate.canonicalize().ok()?;
-    if &canon == &root_canon || canon.strip_prefix(&root_canon).is_ok() {
+    if canon == root_canon || canon.strip_prefix(&root_canon).is_ok() {
         Some(canon)
     } else {
         None

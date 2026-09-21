@@ -136,16 +136,16 @@ pub fn build_app(state: Arc<AppState>) -> Router {
         }
     };
 
-    let app = public
+    
+
+    public
         .route("/.well-known/did.json", get(did_handler))
         .nest_service("/xrpc", atp)
         .merge(receive)
         .merge(protected)
         .with_state(state)
         .layer(axum::middleware::from_fn(middleware::cors_middleware))
-        .layer(axum::middleware::from_fn(middleware::request_logger));
-
-    app
+        .layer(axum::middleware::from_fn(middleware::request_logger))
 }
 
 /// Initialize a fresh `AppState` with the ATproto sub-state populated.

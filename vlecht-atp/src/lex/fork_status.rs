@@ -55,7 +55,7 @@ pub async fn handler(
     let status = if fork_oid == hidden {
         0 // UpToDate
     } else if repo
-        .is_ancestor(&body.branch, &format!("{hidden}"))
+        .is_ancestor(&body.branch, &hidden.to_string())
         .unwrap_or(false)
     {
         1 // FastForwardable

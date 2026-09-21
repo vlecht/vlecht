@@ -5,7 +5,7 @@ use russh::keys::ssh_key::PublicKey;
 use russh::server::{ChannelOpenHandle, Msg, Server as _, Session};
 use russh::{Channel, ChannelId, ChannelStream};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -420,7 +420,7 @@ impl russh::server::Handler for GitSession {
 
 async fn handle_git_command(
     stream: &mut ChannelStream<Msg>,
-    repo_path: &PathBuf,
+    repo_path: &Path,
     command: &str,
     state: &Arc<crate::AppState>,
     auth_did: &str,
@@ -443,7 +443,7 @@ async fn handle_git_command(
 
 async fn handle_upload_pack(
     stream: &mut ChannelStream<Msg>,
-    repo_path: &PathBuf,
+    repo_path: &Path,
 ) -> Result<(), anyhow::Error> {
     // Phase 1: send ref advertisement (v1, no HTTP service header)
     let adv = {
@@ -473,7 +473,7 @@ async fn handle_upload_pack(
 
 async fn handle_receive_pack(
     stream: &mut ChannelStream<Msg>,
-    repo_path: &PathBuf,
+    repo_path: &Path,
     state: &Arc<crate::AppState>,
     auth_did: &str,
     owner: &str,
@@ -757,7 +757,7 @@ fn parse_owner_repo(path: &str) -> Option<(String, String)> {
 /// Reduce an OpenSSH public key line to its canonical `algo base64` form,
 /// dropping any trailing comment. Returns None if the line is malformed.
 fn normalize_pubkey(s: &str) -> Option<String> {
-    let mut parts = s.trim().split_whitespace();
+    let mut parts = s.split_whitespace();
     let algo = parts.next()?;
     let blob = parts.next()?;
     if algo.is_empty() || blob.is_empty() {

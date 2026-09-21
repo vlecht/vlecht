@@ -88,7 +88,7 @@ pub async fn handler(
         .iter()
         .filter_map(|f| f.get("last_commit"))
         .max_by_key(|lc| lc["when"].as_str().unwrap_or("").to_string());
-    let last_commit = last_commit.map(Clone::clone);
+    let last_commit = last_commit.cloned();
 
     let parent = tree_path.map(|s| s.to_string());
     let dotdot = tree_path.and_then(|s| {

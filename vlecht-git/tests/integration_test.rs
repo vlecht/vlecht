@@ -21,7 +21,7 @@ fn cleanup(path: &PathBuf) {
 
 /// Populate a bare repo with content using the `git` binary. Test-only fixture setup.
 /// Creates a repo with 2 commits on `main`, a `feature` branch, and a `v1.0` tag.
-fn populate_bare(bare: &PathBuf, default_branch: &str) {
+fn populate_bare(bare: &std::path::Path, default_branch: &str) {
     GitRepo::init_bare(bare, default_branch).unwrap();
 
     let work = bare.with_file_name(format!(

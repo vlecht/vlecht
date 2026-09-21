@@ -49,6 +49,11 @@ struct ServerHandle {
 }
 
 impl ServerHandle {
+    // ENV_LOCK serializes env-mutating server starts across concurrently
+    // running tests, so it must span the awaited build. Held across an
+    // await is safe here: the guard blocks other test threads, and the
+    // awaited server build never takes ENV_LOCK itself.
+    #[allow(clippy::await_holding_lock)]
     async fn start() -> Self {
         let _env_guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // Default: an owner DID is set, so `sh.tangled.owner` succeeds.
@@ -58,6 +63,7 @@ impl ServerHandle {
         Self::start_with_env().await
     }
 
+    #[allow(clippy::await_holding_lock)]
     async fn start_with_no_owner() -> Self {
         let _env_guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::remove_var("VLECHT_ATP_OWNER_DID");
@@ -1035,6 +1041,7 @@ async fn start_server_with_did(tmpdir: PathBuf, port: u16) -> ServerHandle {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[allow(clippy::await_holding_lock)] // see ServerHandle::start
 async fn did_web_document_served_with_correct_shape() {
     let _env_guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let port = unique_port();
@@ -1092,6 +1099,7 @@ async fn did_web_document_served_with_correct_shape() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[allow(clippy::await_holding_lock)] // see ServerHandle::start
 async fn did_web_document_returns_404_when_atproto_disabled() {
     // Start a server WITHOUT audience DID set — ATproto is disabled.
     // Must run with env lock to avoid interference from other tests that
@@ -1164,41 +1172,32 @@ impl jacquard_identity::resolver::IdentityResolver for MockResolver {
         OPTS.get_or_init(Default::default)
     }
 
-    fn resolve_handle<S: jacquard_common::BosStr + Sync>(
+    async fn resolve_handle<S: jacquard_common::BosStr + Sync>(
         &self,
         _handle: &jacquard_common::types::string::Handle<S>,
-    ) -> impl std::future::Future<
-        Output = Result<
-            jacquard_common::types::string::Did,
-            jacquard_identity::resolver::IdentityError,
-        >,
-    > + Send {
-        async { Err(jacquard_identity::resolver::IdentityError::handle_resolution_exhausted()) }
+    ) -> Result<
+        jacquard_common::types::string::Did,
+        jacquard_identity::resolver::IdentityError,
+    > {
+        Err(jacquard_identity::resolver::IdentityError::handle_resolution_exhausted())
     }
 
-    fn resolve_did_doc<S: jacquard_common::BosStr + Sync>(
+    async fn resolve_did_doc<S: jacquard_common::BosStr + Sync>(
         &self,
         did: &jacquard_common::types::did::Did<S>,
-    ) -> impl std::future::Future<
-        Output = Result<
-            jacquard_identity::resolver::DidDocResponse,
-            jacquard_identity::resolver::IdentityError,
-        >,
-    > + Send {
-        let doc = self.did_docs.get(did.as_str()).cloned();
-        async move {
-            let Some(doc) = doc else {
-                return Err(
-                    jacquard_identity::resolver::IdentityError::handle_resolution_exhausted(),
-                );
-            };
-            let json = serde_json::to_vec(&doc).unwrap();
-            Ok(jacquard_identity::resolver::DidDocResponse {
-                buffer: bytes::Bytes::from(json),
-                status: reqwest::StatusCode::OK,
-                requested: Some(doc.id.clone()),
-            })
-        }
+    ) -> Result<
+        jacquard_identity::resolver::DidDocResponse,
+        jacquard_identity::resolver::IdentityError,
+    > {
+        let Some(doc) = self.did_docs.get(did.as_str()).cloned() else {
+            return Err(jacquard_identity::resolver::IdentityError::handle_resolution_exhausted());
+        };
+        let json = serde_json::to_vec(&doc).unwrap();
+        Ok(jacquard_identity::resolver::DidDocResponse {
+            buffer: bytes::Bytes::from(json),
+            status: reqwest::StatusCode::OK,
+            requested: Some(doc.id.clone()),
+        })
     }
 }
 
@@ -1611,7 +1610,7 @@ async fn xrpc_write_delete_branch() {
     // Branch should no longer appear
     let (status2, body2) = fetch_json(
         &server,
-        &format!("/xrpc/sh.tangled.repo.branches?repo=did:plc:testowner/del-branch"),
+        "/xrpc/sh.tangled.repo.branches?repo=did:plc:testowner/del-branch",
     )
     .await;
     assert_eq!(status2, 200);
