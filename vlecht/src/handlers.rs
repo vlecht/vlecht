@@ -58,6 +58,20 @@ fn maybe_decompress(headers: &axum::http::HeaderMap, body: &axum::body::Bytes) -
 
 // --- git smart HTTP ---
 
+/// Whether the client negotiated git protocol v2 via the `Git-Protocol`
+/// header (e.g. `version=2`). Required by knot2's fork fetcher.
+fn wants_v2(headers: &http::HeaderMap) -> bool {
+    headers
+        .get("git-protocol")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.split(',').any(|t| t.trim() == "version=2"))
+}
+
+/// Sniff a v2 request body: its first pkt-line starts with `command=`.
+fn request_is_v2(body: &[u8]) -> bool {
+    body.get(4..12).is_some_and(|s| s.starts_with(b"command="))
+}
+
 #[derive(Deserialize)]
 pub struct InfoRefsParams {
     service: Option<String>,
@@ -67,9 +81,10 @@ pub async fn info_refs(
     State(state): State<Arc<AppState>>,
     Path((owner, repo)): Path<(String, String)>,
     Query(params): Query<InfoRefsParams>,
+    headers: http::HeaderMap,
     auth: MaybeDid,
 ) -> Result<Response, StatusCode> {
-    info_refs_inner(&state, &owner, &repo, params, auth).await
+    info_refs_inner(&state, &owner, &repo, params, &headers, auth).await
 }
 
 /// Single-segment form: `/{repo_did}/info/refs` — the Go knotserver and
@@ -78,9 +93,10 @@ pub async fn info_refs_did(
     State(state): State<Arc<AppState>>,
     Path(repo_did): Path<String>,
     Query(params): Query<InfoRefsParams>,
+    headers: http::HeaderMap,
     auth: MaybeDid,
 ) -> Result<Response, StatusCode> {
-    info_refs_inner(&state, &repo_did, "", params, auth).await
+    info_refs_inner(&state, &repo_did, "", params, &headers, auth).await
 }
 
 async fn info_refs_inner(
@@ -88,6 +104,7 @@ async fn info_refs_inner(
     owner: &str,
     repo: &str,
     params: InfoRefsParams,
+    headers: &http::HeaderMap,
     auth: MaybeDid,
 ) -> Result<Response, StatusCode> {
     assert_read_auth(state, owner, repo, auth.0.as_deref()).await?;
@@ -95,9 +112,12 @@ async fn info_refs_inner(
 
     match params.service.as_deref() {
         Some("git-upload-pack") => {
-            let data = git_repo
-                .upload_pack_advertise()
-                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+            let data = if wants_v2(headers) {
+                git_repo.upload_pack_advertise_v2()
+            } else {
+                git_repo.upload_pack_advertise()
+            }
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
             Ok(Response::builder()
                 .header(header::CONNECTION, "Keep-Alive")
                 .header(
@@ -165,9 +185,15 @@ async fn upload_pack_inner(
     let git_repo = open_repo(state, owner, repo).await?;
     let decompressed = maybe_decompress(&headers, &body);
 
-    let data = git_repo
-        .upload_pack_response(&decompressed)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let data = if wants_v2(&headers) || request_is_v2(&decompressed) {
+        git_repo
+            .upload_pack_v2(&decompressed)
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    } else {
+        git_repo
+            .upload_pack_response(&decompressed)
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    };
 
     Ok(Response::builder()
         .header(header::CONTENT_TYPE, "application/x-git-upload-pack-result")

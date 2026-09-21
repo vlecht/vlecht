@@ -1,3 +1,4 @@
+use vlecht_git::error::GitError;
 use vlecht_git::{ArchiveFormat, GitRepo};
 use std::path::PathBuf;
 use std::process::Command;
@@ -459,5 +460,292 @@ fn upload_pack_response_empty_wants_returns_nak_only() {
     let text = String::from_utf8_lossy(&response);
     assert!(text.contains("NAK"));
     assert!(!text.contains("PACK"));
+    cleanup(&dir);
+}
+
+// ---------------------------------------------------------------------------
+// upload-pack: protocol v2 (required by knot2 fork sources)
+// ---------------------------------------------------------------------------
+
+fn pkt_line(text: &str) -> String {
+    let with_nl = format!("{text}\n");
+    format!("{:04x}{}", 4 + with_nl.len(), with_nl)
+}
+
+const PKT_DELIM: &str = "0001";
+const PKT_FLUSH: &str = "0000";
+
+/// Build a v2 request body: header lines, delimiter, argument lines, flush.
+fn v2_request(header: &[&str], args: &[String]) -> String {
+    let mut body = String::new();
+    for line in header {
+        body.push_str(&pkt_line(line));
+    }
+    body.push_str(PKT_DELIM);
+    for line in args {
+        body.push_str(&pkt_line(line));
+    }
+    body.push_str(PKT_FLUSH);
+    body
+}
+
+/// Decode a response body into payloads; None marks flush/delimiter frames.
+fn v2_payloads(body: &[u8]) -> Vec<Option<Vec<u8>>> {
+    let mut out = Vec::new();
+    let mut pos = 0;
+    while pos + 4 <= body.len() {
+        let len = usize::from_str_radix(std::str::from_utf8(&body[pos..pos + 4]).unwrap(), 16)
+            .unwrap();
+        if len == 0 || len == 1 {
+            out.push(None);
+            pos += 4;
+        } else {
+            out.push(Some(body[pos + 4..pos + len].to_vec()));
+            pos += len;
+        }
+    }
+    out
+}
+
+fn payload_lines(body: &[u8]) -> Vec<String> {
+    v2_payloads(body)
+        .into_iter()
+        .flatten()
+        .map(|p| String::from_utf8_lossy(&p).trim_end().to_string())
+        .filter(|l| !l.is_empty())
+        .collect()
+}
+
+/// Reassemble sideband channel-1 payloads into the raw pack bytes.
+fn reassemble_pack(body: &[u8]) -> Vec<u8> {
+    let mut pack = Vec::new();
+    for payload in v2_payloads(body).into_iter().flatten() {
+        if payload.first() == Some(&0x01) {
+            pack.extend_from_slice(&payload[1..]);
+        }
+    }
+    pack
+}
+
+#[test]
+fn upload_pack_advertise_v2_lists_v2_capabilities() {
+    let (repo, dir) = setup_repo("adv2_populated", "main");
+    let body = repo.upload_pack_advertise_v2().unwrap();
+    let lines = payload_lines(&body);
+
+    assert_eq!(lines[0], "# service=git-upload-pack");
+    assert!(lines.contains(&"version 2".to_string()));
+    assert!(lines.contains(&"ls-refs".to_string()));
+    assert!(lines.contains(&"fetch".to_string()));
+    assert!(lines.contains(&"object-format=sha1".to_string()));
+    // v2 advertisements carry capabilities only — no refs.
+    assert!(!lines.iter().any(|l| l.contains("refs/heads/")));
+    assert!(body.ends_with(b"0000"));
+    cleanup(&dir);
+}
+
+#[test]
+fn upload_pack_advertise_v2_works_for_empty_repo() {
+    let dir = fresh_dir("adv2_empty");
+    let bare = dir.join("empty.git");
+    GitRepo::init_bare(&bare, "main").unwrap();
+    let repo = GitRepo::open(&bare).unwrap();
+
+    let body = repo.upload_pack_advertise_v2().unwrap();
+    assert!(payload_lines(&body).contains(&"version 2".to_string()));
+    cleanup(&dir);
+}
+
+#[test]
+fn upload_pack_v2_ls_refs_serves_knot2_request() {
+    let (repo, dir) = setup_repo("lsrefs_populated", "main");
+    let tip = tip_sha(&repo);
+
+    // Byte-for-byte the request knot2's fork fetcher sends.
+    let body = v2_request(
+        &["command=ls-refs", "agent=knot/0"],
+        &[
+            "symrefs".to_string(),
+            "ref-prefix HEAD".to_string(),
+            "ref-prefix refs/heads/".to_string(),
+            "ref-prefix refs/tags/".to_string(),
+        ],
+    );
+    let response = repo.upload_pack_v2(body.as_bytes()).unwrap();
+    let lines = payload_lines(&response);
+
+    assert!(
+        lines.contains(&format!("{tip} HEAD symref-target:refs/heads/main")),
+        "HEAD line missing: {lines:?}"
+    );
+    assert!(lines.contains(&format!("{tip} refs/heads/main")));
+    assert!(lines.iter().any(|l| l.ends_with(" refs/heads/feature")));
+    assert!(lines.iter().any(|l| l.ends_with(" refs/tags/v1.0")));
+    assert_eq!(lines.len(), 4, "HEAD + 2 branches + 1 tag: {lines:?}");
+    assert!(response.ends_with(b"0000"));
+    cleanup(&dir);
+}
+
+#[test]
+fn upload_pack_v2_ls_refs_ref_prefix_filters() {
+    let (repo, dir) = setup_repo("lsrefs_prefix", "main");
+
+    let body = v2_request(
+        &["command=ls-refs"],
+        &["ref-prefix refs/heads/main".to_string()],
+    );
+    let lines = payload_lines(&repo.upload_pack_v2(body.as_bytes()).unwrap());
+
+    assert_eq!(lines.len(), 1);
+    assert!(lines[0].ends_with(" refs/heads/main"));
+    cleanup(&dir);
+}
+
+#[test]
+fn upload_pack_v2_ls_refs_peels_annotated_tags() {
+    let (_repo, dir) = setup_repo("lsrefs_peel", "main");
+    let bare = dir.join("repo.git");
+
+    // Push an annotated tag (a real tag object) from a scratch clone.
+    let scratch = dir.join("scratch");
+    std::fs::create_dir_all(&scratch).unwrap();
+    let run_in = |cwd: &std::path::Path, args: &[&str]| {
+        let out = Command::new("git").args(args).current_dir(cwd).output().unwrap();
+        assert!(
+            out.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    run_in(
+        &scratch,
+        &["clone", "-q", "--no-checkout", bare.to_str().unwrap(), "work"],
+    );
+    let work = scratch.join("work");
+    run_in(&work, &["config", "user.email", "t@t.test"]);
+    run_in(&work, &["config", "user.name", "T"]);
+    run_in(&work, &["tag", "-a", "v2.0", "-m", "release", "main"]);
+    run_in(&work, &["push", "-q", "origin", "v2.0"]);
+
+    let repo = GitRepo::open(&bare).unwrap();
+    let body = v2_request(
+        &["command=ls-refs"],
+        &["peel".to_string(), "ref-prefix refs/tags/v2.0".to_string()],
+    );
+    let lines = payload_lines(&repo.upload_pack_v2(body.as_bytes()).unwrap());
+
+    // Annotated tag: line starts at the tag object, ends at the peeled commit.
+    assert_eq!(lines.len(), 1);
+    assert!(lines[0].contains(" refs/tags/v2.0 peeled:"));
+    let (tag_oid, rest) = lines[0].split_once(' ').unwrap();
+    let peeled = rest.split(" peeled:").nth(1).unwrap();
+    assert_ne!(tag_oid, peeled);
+
+    // Without `peel` the attribute is omitted.
+    let body = v2_request(&["command=ls-refs"], &["ref-prefix refs/tags/v2.0".to_string()]);
+    let lines = payload_lines(&repo.upload_pack_v2(body.as_bytes()).unwrap());
+    assert!(!lines[0].contains("peeled:"));
+    cleanup(&dir);
+}
+
+#[test]
+fn upload_pack_v2_fetch_sends_packfile_section() {
+    let (repo, dir) = setup_repo("v2fetch_populated", "main");
+    let tip = tip_sha(&repo);
+
+    // Byte-for-byte the request knot2's fork fetcher sends.
+    let body = v2_request(
+        &["command=fetch", "agent=knot/0"],
+        &[
+            "no-progress".to_string(),
+            "ofs-delta".to_string(),
+            format!("want {tip}"),
+            "done".to_string(),
+        ],
+    );
+    let response = repo.upload_pack_v2(body.as_bytes()).unwrap();
+    let lines = payload_lines(&response);
+    assert_eq!(lines[0], "packfile", "response must start with packfile section");
+    assert!(!lines.iter().any(|l| l == "acknowledgments" || l == "NAK"));
+
+    let pack = reassemble_pack(&response);
+    assert!(pack.starts_with(b"PACK"), "reassembled pack must start with PACK");
+    // header (12) + at least one object + sha1 trailer (20)
+    assert!(pack.len() > 12 + 20);
+    assert!(response.ends_with(b"0000"));
+    cleanup(&dir);
+}
+
+#[test]
+fn upload_pack_v2_fetch_without_done_sends_acknowledgments() {
+    let (repo, dir) = setup_repo("v2fetch_acks", "main");
+    let tip = tip_sha(&repo);
+
+    let body = v2_request(
+        &["command=fetch", "agent=knot/0"],
+        &[
+            format!("want {tip}"),
+            format!("have {tip}"),
+        ],
+    );
+    let lines = payload_lines(&repo.upload_pack_v2(body.as_bytes()).unwrap());
+
+    assert_eq!(lines[0], "acknowledgments");
+    assert!(lines.contains(&format!("ACK {tip}")));
+    assert!(!lines.iter().any(|l| l == "packfile"));
+    cleanup(&dir);
+}
+
+#[test]
+fn upload_pack_v2_fetch_without_common_haves_sends_nak() {
+    let (repo, dir) = setup_repo("v2fetch_nak", "main");
+    let tip = tip_sha(&repo);
+
+    let body = v2_request(
+        &["command=fetch"],
+        &[format!("want {tip}"), "have 1111111111111111111111111111111111111111".to_string()],
+    );
+    let lines = payload_lines(&repo.upload_pack_v2(body.as_bytes()).unwrap());
+
+    assert!(lines.contains(&"NAK".to_string()));
+    cleanup(&dir);
+}
+
+#[test]
+fn upload_pack_v2_fetch_missing_want_returns_err_pkt() {
+    let (repo, dir) = setup_repo("v2fetch_missing", "main");
+
+    let body = v2_request(
+        &["command=fetch"],
+        &[
+            "want 2222222222222222222222222222222222222222".to_string(),
+            "done".to_string(),
+        ],
+    );
+    let lines = payload_lines(&repo.upload_pack_v2(body.as_bytes()).unwrap());
+
+    assert_eq!(lines.len(), 1);
+    assert!(lines[0].starts_with("ERR "));
+    cleanup(&dir);
+}
+
+#[test]
+fn upload_pack_v2_unknown_command_is_protocol_error() {
+    let (repo, dir) = setup_repo("v2_unknown_cmd", "main");
+    let body = v2_request(&["command=whatever"], &[]);
+
+    let err = repo.upload_pack_v2(body.as_bytes()).unwrap_err();
+    assert!(matches!(err, GitError::Protocol(_)));
+    cleanup(&dir);
+}
+
+#[test]
+fn upload_pack_v2_no_command_is_protocol_error() {
+    let (repo, dir) = setup_repo("v2_no_cmd", "main");
+    let body = v2_request(&["agent=knot/0"], &["symrefs".to_string()]);
+
+    let err = repo.upload_pack_v2(body.as_bytes()).unwrap_err();
+    assert!(matches!(err, GitError::Protocol(_)));
     cleanup(&dir);
 }

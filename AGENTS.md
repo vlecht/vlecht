@@ -126,6 +126,20 @@ report-status report-status-v2 delete-refs side-band-64k
 
 The response is built in `GitRepo::receive_pack` (search for `pkt_len` near the bottom of that method). Don't change the response format without testing against real `git push` from a version ≥2.38 client.
 
+## The upload-pack protocol: v0 and v2
+
+Upload-pack serves **both** protocol versions. Version is negotiated via the `Git-Protocol: version=2` request header (checked in `handlers.rs` `wants_v2`; POST bodies are also sniffed for a leading `command=` pkt-line).
+
+- **v0** (`info/refs` without the header): ref list + capabilities, then `POST` with `want`/`have` lines. Code: `upload_pack_advertise` / `upload_pack_response`.
+- **v2** (header present): `info/refs` returns a capability advertisement only (`version 2`, `ls-refs`, `fetch`, `object-format` — **no refs**). The client then POSTs pkt-line commands (`command=ls-refs` or `command=fetch`) with a `0001` delimiter separating header from arguments. Code: `upload_pack_advertise_v2` / `upload_pack_v2` → `ls_refs` / `fetch_v2`.
+
+**Why v2 is mandatory:** knot2 knots (knot.tangled.org and other Rust knots) hard-require it when forking from a remote source — their `knot_pack::parse_advertisement` rejects any upstream without `version 2` + `ls-refs` + `fetch`, which surfaces in the appview UI as a generic "xrpc request failed". Real git clients fall back to v0, so missing v2 only breaks knot-to-knot forks.
+
+v2 details that matter:
+- `ls-refs` ref lines are `<oid> <refname>[ symref-target:<ref>][ peeled:<oid>]`. For annotated tags the advertised oid is the **tag object**; `peeled:` (only when the client sends `peel`) is the commit it dereferences to. HEAD's symref target comes from `repo.head().referent_name()`.
+- `fetch` with `done` (what knot2 and stateless HTTP git always send) → acknowledgments section MUST be omitted; response is `packfile` header pkt + sideband channel-1 pkts + flush. Without `done` → `acknowledgments` section (ACK per common have, else NAK) and no pack.
+- Per-request failures are reported as `ERR <message>` pkt-lines, not HTTP errors.
+
 ## Pack generation
 
 `upload_pack_response` builds pack bytes via `gix_pack::data::output::bytes::FromEntriesIter`. Previously this was hand-rolled (pack headers, object type numbers, continuation-byte encoding, SHA1 trailer). Using gix's writer means we don't maintain our own copy of the packfile wire format. The `gix-pack` crate needs the `"generate"` feature enabled.

@@ -524,6 +524,27 @@ impl GitRepo {
         advertise_refs(self, "git-upload-pack", CAPABILITIES, false)
     }
 
+    /// Capability advertisement for git protocol v2 (client sent
+    /// `Git-Protocol: version=2`). Unlike v0 no refs are listed; the
+    /// client follows up with `command=ls-refs` on the POST endpoint.
+    ///
+    /// knot2 knots (e.g. knot.tangled.org) hard-require v2 when forking
+    /// from a remote source and reject v0-only upstreams.
+    pub fn upload_pack_advertise_v2(&self) -> Result<Vec<u8>, GitError> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&pkt_encode_comment("service=git-upload-pack"));
+        out.extend_from_slice(pkt_flush());
+        out.extend_from_slice(&pkt_encode(b"version 2\n"));
+        out.extend_from_slice(&pkt_encode(b"agent=vlecht\n"));
+        out.extend_from_slice(&pkt_encode(b"ls-refs\n"));
+        out.extend_from_slice(&pkt_encode(b"fetch\n"));
+        out.extend_from_slice(&pkt_encode(
+            format!("object-format={}\n", self.inner.object_hash()).as_bytes(),
+        ));
+        out.extend_from_slice(pkt_flush());
+        Ok(out)
+    }
+
     pub fn upload_pack_response(&self, request_body: &[u8]) -> Result<Vec<u8>, GitError> {
         let request = UploadPackRequest::parse(request_body)?;
         if request.wants.is_empty() {
@@ -537,6 +558,164 @@ impl GitRepo {
         send_sideband(&mut response, &pack_bytes);
         response.extend_from_slice(pkt_flush());
         Ok(response)
+    }
+
+    /// Handle a git protocol v2 request body (`command=ls-refs` or
+    /// `command=fetch`). Returns the raw response body.
+    pub fn upload_pack_v2(&self, request_body: &[u8]) -> Result<Vec<u8>, GitError> {
+        let mut command = "";
+        let mut args: Vec<&str> = Vec::new();
+        let mut in_args = false;
+        for pkt in read_pkts(request_body)? {
+            match pkt {
+                Pkt::Delim => in_args = true,
+                Pkt::Flush => break,
+                Pkt::Data(payload) => {
+                    let line = std::str::from_utf8(payload)
+                        .map_err(|_| GitError::Protocol("non-utf8 pkt-line in v2 request".into()))?
+                        .trim_end_matches('\n');
+                    if in_args {
+                        args.push(line);
+                    } else if let Some(cmd) = line.strip_prefix("command=") {
+                        command = cmd;
+                    }
+                }
+            }
+        }
+
+        match command {
+            "ls-refs" => self.ls_refs(&args),
+            "fetch" => self.fetch_v2(&args),
+            other => Err(GitError::Protocol(format!("unsupported v2 command: {other}"))),
+        }
+    }
+
+    /// `command=ls-refs`: pkt-lines of `<oid> <refname>` filtered by the
+    /// client's `ref-prefix` arguments, then flush. `symrefs` adds a
+    /// `symref-target:` attribute to HEAD, `peel` adds `peeled:` for
+    /// annotated tags.
+    fn ls_refs(&self, args: &[&str]) -> Result<Vec<u8>, GitError> {
+        let mut symrefs = false;
+        let mut peel = false;
+        let mut prefixes: Vec<&str> = Vec::new();
+        for arg in args {
+            match *arg {
+                "symrefs" => symrefs = true,
+                "peel" => peel = true,
+                _ => {
+                    if let Some(prefix) = arg.strip_prefix("ref-prefix ") {
+                        prefixes.push(prefix);
+                    }
+                }
+            }
+        }
+        let advertised =
+            |name: &str| prefixes.is_empty() || prefixes.iter().any(|p| name.starts_with(p));
+
+        let mut out = Vec::new();
+
+        if advertised("HEAD") {
+            let head = self.inner.head()?;
+            if let Some(id) = head.id() {
+                let mut line = format!("{id} HEAD");
+                if symrefs {
+                    if let Some(referent) = head.referent_name() {
+                        line.push_str(&format!(" symref-target:{}", referent.as_bstr()));
+                    }
+                }
+                out.extend_from_slice(&pkt_encode(format!("{line}\n").as_bytes()));
+            }
+        }
+
+        let platform = self.inner.references()?;
+        for r in platform.all()? {
+            let mut r = r?;
+            let name = r.name().as_bstr().to_string();
+            if !advertised(&name) {
+                continue;
+            }
+            // The advertised oid is the ref's direct target (for annotated
+            // tags, the tag object); symbolic refs advertise their peeled id.
+            let direct = match r.target() {
+                gix_ref::TargetRef::Object(oid) => Some(oid.to_owned()),
+                gix_ref::TargetRef::Symbolic(_) => None,
+            };
+            let peeled_id = r.peel_to_id()?;
+            let oid = direct.unwrap_or_else(|| peeled_id.detach());
+            let mut line = format!("{oid} {name}");
+            if peel && direct.is_some_and(|oid| oid != peeled_id) {
+                line.push_str(&format!(" peeled:{peeled_id}"));
+            }
+            out.extend_from_slice(&pkt_encode(format!("{line}\n").as_bytes()));
+        }
+
+        out.extend_from_slice(pkt_flush());
+        Ok(out)
+    }
+
+    /// `command=fetch`: build the response for the client's wants/haves.
+    ///
+    /// With `done` (what knot2's fork fetch and git's stateless HTTP
+    /// fetches send) the acknowledgments section is omitted per the v2
+    /// spec and the packfile section is sent directly. Without `done`
+    /// only an acknowledgments section is sent; the client drives
+    /// further rounds.
+    fn fetch_v2(&self, args: &[&str]) -> Result<Vec<u8>, GitError> {
+        let mut wants = Vec::new();
+        let mut haves = Vec::new();
+        let mut done = false;
+        for arg in args {
+            if let Some(rest) = arg.strip_prefix("want ") {
+                match gix::ObjectId::from_hex(
+                    rest.split_whitespace().next().unwrap_or("").as_bytes(),
+                ) {
+                    Ok(oid) => wants.push(oid),
+                    Err(_) => return Ok(err_pkt("invalid want oid")),
+                }
+            } else if let Some(rest) = arg.strip_prefix("have ") {
+                match gix::ObjectId::from_hex(
+                    rest.split_whitespace().next().unwrap_or("").as_bytes(),
+                ) {
+                    Ok(oid) => haves.push(oid),
+                    Err(_) => return Ok(err_pkt("invalid have oid")),
+                }
+            } else if *arg == "done" {
+                done = true;
+            }
+            // no-progress, ofs-delta and friends need no server-side action.
+        }
+
+        if !done {
+            let mut out = pkt_encode(b"acknowledgments\n");
+            let mut acked = false;
+            for have in &haves {
+                if self.inner.find_object(*have).is_ok() {
+                    out.extend_from_slice(&pkt_encode(format!("ACK {have}\n").as_bytes()));
+                    acked = true;
+                }
+            }
+            if !acked {
+                out.extend_from_slice(&pkt_encode(b"NAK\n"));
+            }
+            out.extend_from_slice(pkt_flush());
+            return Ok(out);
+        }
+
+        for want in &wants {
+            if self.inner.find_object(*want).is_err() {
+                return Ok(err_pkt(&format!("want {want} not present on server")));
+            }
+        }
+        if wants.is_empty() {
+            return Ok(Vec::from(pkt_flush()));
+        }
+
+        let oids = collect_all_oids(&self.inner, &wants, &haves)?;
+        let pack_bytes = generate_pack_bytes(&self.inner, &oids)?;
+        let mut out = pkt_encode(b"packfile\n");
+        send_sideband(&mut out, &pack_bytes);
+        out.extend_from_slice(pkt_flush());
+        Ok(out)
     }
     // -----------------------------------------------------------------------
     // receive-pack
@@ -1133,6 +1312,51 @@ fn pkt_encode_comment(comment: &str) -> Vec<u8> {
     pkt_encode(format!("# {comment}\n").as_bytes())
 }
 
+/// A parsed pkt-line from a protocol v2 request.
+enum Pkt<'a> {
+    Data(&'a [u8]),
+    Delim,
+    Flush,
+}
+
+/// Parse pkt-lines from a protocol v2 request body.
+fn read_pkts(body: &[u8]) -> Result<Vec<Pkt<'_>>, GitError> {
+    let mut out = Vec::new();
+    let mut pos = 0;
+    while pos + 4 <= body.len() {
+        let len_str = std::str::from_utf8(&body[pos..pos + 4])
+            .map_err(|_| GitError::Protocol("invalid pkt-line".into()))?;
+        let len = usize::from_str_radix(len_str, 16)
+            .map_err(|_| GitError::Protocol("invalid pkt-line len".into()))?;
+        match len {
+            0 => {
+                out.push(Pkt::Flush);
+                pos += 4;
+            }
+            1 => {
+                out.push(Pkt::Delim);
+                pos += 4;
+            }
+            2 => pos += 4, // response-end is never meaningful on requests
+            3 => return Err(GitError::Protocol("invalid pkt-line length".into())),
+            n => {
+                if pos + n > body.len() {
+                    return Err(GitError::Protocol("truncated pkt-line".into()));
+                }
+                out.push(Pkt::Data(&body[pos + 4..pos + n]));
+                pos += n;
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// An `ERR <message>` pkt-line, the v2 way to report a per-request
+/// failure to the client without failing the HTTP request itself.
+fn err_pkt(message: &str) -> Vec<u8> {
+    pkt_encode(format!("ERR {message}\n").as_bytes())
+}
+
 fn nak_only() -> Vec<u8> {
     let mut buf = Vec::new();
     buf.extend_from_slice(&pkt_encode(b"NAK\n"));
@@ -1517,6 +1741,34 @@ mod tests {
         let encoded = pkt_encode_comment("service=git-upload-pack");
         let text = std::str::from_utf8(&encoded[4..]).unwrap();
         assert!(text.starts_with("# service=git-upload-pack\n"));
+    }
+
+    // --- protocol v2 pkt parsing ---
+
+    #[test]
+    fn read_pkts_parses_data_delim_and_flush() {
+        let body = b"0014command=ls-refs\n00010011agent=knot/0\n00000000";
+        let pkts = read_pkts(body).unwrap();
+        assert!(matches!(pkts[0], Pkt::Data(b"command=ls-refs\n")));
+        assert!(matches!(pkts[1], Pkt::Delim));
+        assert!(matches!(pkts[2], Pkt::Data(b"agent=knot/0\n")));
+        assert!(matches!(pkts[3], Pkt::Flush));
+    }
+
+    #[test]
+    fn read_pkts_rejects_truncated_pkt() {
+        let body = b"000dshort";
+        assert!(matches!(
+            read_pkts(body),
+            Err(GitError::Protocol(_))
+        ));
+    }
+
+    #[test]
+    fn err_pkt_prefixes_message() {
+        let encoded = err_pkt("boom");
+        assert_eq!(&encoded[..4], b"000d");
+        assert_eq!(&encoded[4..], b"ERR boom\n");
     }
 
     // --- send_sideband ---

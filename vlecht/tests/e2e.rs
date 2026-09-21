@@ -335,6 +335,88 @@ async fn e2e_git_clone() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn e2e_git_clone_protocol_v2() {
+    let port = unique_port();
+    let server = ServerHandle::start(port, None).await;
+
+    let repo_path = server.init_repo("alice", "myrepo").await;
+    let wd = server.workdir("clone_v2_work");
+
+    let src = wd.join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    git(&src, &["init"]);
+    std::fs::write(src.join("README.md"), "hello v2\n").unwrap();
+    git(&src, &["add", "."]);
+    git(&src, &["commit", "-m", "initial"]);
+    git(
+        &src,
+        &["remote", "add", "origin", repo_path.to_str().unwrap()],
+    );
+    git(&src, &["push", "origin", "main"]);
+
+    // Clone forcing git protocol v2 — what knot2's fork fetcher speaks.
+    let dest = wd.join("clone");
+    let remote = format!("http://127.0.0.1:{port}/alice/myrepo");
+    git(
+        &wd,
+        &[
+            "-c",
+            "protocol.version=2",
+            "clone",
+            &remote,
+            dest.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(
+        std::fs::read_to_string(dest.join("README.md")).unwrap(),
+        "hello v2\n"
+    );
+
+    // The clone must have used the v2 symref for its HEAD.
+    let head = std::fs::read_to_string(dest.join(".git").join("HEAD")).unwrap();
+    assert!(head.contains("refs/heads/main"), "HEAD: {head}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_git_fetch_protocol_v0_still_works() {
+    let port = unique_port();
+    let server = ServerHandle::start(port, None).await;
+
+    let repo_path = server.init_repo("alice", "myrepo").await;
+    let wd = server.workdir("fetch_v0_work");
+
+    let src = wd.join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    git(&src, &["init"]);
+    std::fs::write(src.join("README.md"), "hello v0\n").unwrap();
+    git(&src, &["add", "."]);
+    git(&src, &["commit", "-m", "initial"]);
+    git(
+        &src,
+        &["remote", "add", "origin", repo_path.to_str().unwrap()],
+    );
+    git(&src, &["push", "origin", "main"]);
+
+    // Clone with protocol v0 to pin the legacy path alongside v2.
+    let dest = wd.join("clone");
+    let remote = format!("http://127.0.0.1:{port}/alice/myrepo");
+    git(
+        &wd,
+        &[
+            "-c",
+            "protocol.version=0",
+            "clone",
+            &remote,
+            dest.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(
+        std::fs::read_to_string(dest.join("README.md")).unwrap(),
+        "hello v0\n"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn e2e_git_push() {
     let port = unique_port();
     let server = ServerHandle::start(port, None).await;
